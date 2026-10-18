@@ -1,0 +1,348 @@
+// The orin-web request: what a handler sees. It is built from an `std:http` request by the server (`requestFromHttp`) or
+// directly by a test (`Request.tryNew`, or `testing.or`). Everything is a value: a middleware changes a request by making a
+// modified copy (`withAttr`, `withParams`), never by mutating the one it was given.
+import { Method, Headers, methodName, toLowerAscii, eqIgnoreCase } from "std:http";
+import { Bytes } from "std:bytes";
+import {
+  QueryPair, PlusAsSpace, PercentSpace, parseQuery, percentDecode, urlErrorMessage,
+} from "std:url";
+import { JsonValue, parseDocument, defaultReadOptions, jsonParseErrorMessage } from "std:json";
+import { isValid } from "std:utf8";
+import { WebError, badRequest, notFound } from "./error";
+
+// The parts of a request, for `Request.tryNew`. `target` is the request-target as it came on the wire: an origin-form
+// path with an optional query ("/users/7?verbose=1"), or "*".
+export type RequestParts = { method: Method; target: string; headers: Headers; body: Bytes; };
+
+function pathOf(target: string): string {
+  let end = target.length;
+  let i: usize = 0;
+  while (i < target.length) {
+    const c = target.charCodeAt(i);
+    if (c == 63 || c == 35) {
+      end = i;
+      i = target.length;
+    } else {
+      i += 1;
+    }
+  }
+  return target.substring(0, end);
+}
+
+function queryOf(target: string): string {
+  const q = target.indexOf("?");
+  if (q.isNone()) {
+    return "";
+  }
+  const begin = q.unwrap() + 1;
+  let end = target.length;
+  let i = begin;
+  while (i < target.length) {
+    if (target.charCodeAt(i) == 35) {
+      end = i;
+      i = target.length;
+    } else {
+      i += 1;
+    }
+  }
+  return target.substring(begin, end);
+}
+
+// The non-empty segments of a path, each percent-decoded after the split (so "%2F" stays inside one segment). Err when an
+// escape is malformed or a segment is not valid UTF-8.
+function decodeSegments(path: string): Result<string[], WebError> {
+  let out: string[] = [];
+  for (const raw of path.split("/")) {
+    if (raw.length > 0) {
+      const d = percentDecode(raw, PercentSpace);
+      if (d.isErr()) {
+        return Err(badRequest("invalid path: " + urlErrorMessage(d.unwrapErr())));
+      }
+      out.push(d.unwrap());
+    }
+  }
+  return Ok(out);
+}
+
+function findPair(ps: QueryPair[], key: string): Option<string> {
+  for (const p of ps) {
+    if (p.key == key) {
+      return Some(p.value);
+    }
+  }
+  return None;
+}
+
+function allPairs(ps: QueryPair[], key: string): string[] {
+  let out: string[] = [];
+  for (const p of ps) {
+    if (p.key == key) {
+      out.push(p.value);
+    }
+  }
+  return out;
+}
+
+export class Request {
+  private reqMethod: Method;
+  private reqTarget: string;
+  private reqPath: string;
+  private reqSegments: string[];
+  private reqQuery: QueryPair[];
+  private reqHeaders: Headers;
+  private reqBody: Bytes;
+  private reqParams: QueryPair[];
+  private reqAttrs: QueryPair[];
+
+  constructor(
+    method: Method,
+    target: string,
+    path: string,
+    segments: string[],
+    query: QueryPair[],
+    headers: Headers,
+    body: Bytes,
+    params: QueryPair[],
+    attrs: QueryPair[],
+  ) {
+    this.reqMethod = method;
+    this.reqTarget = target;
+    this.reqPath = path;
+    this.reqSegments = segments;
+    this.reqQuery = query;
+    this.reqHeaders = headers;
+    this.reqBody = body;
+    this.reqParams = params;
+    this.reqAttrs = attrs;
+  }
+
+  // Request.tryNew(parts): Result<Request, WebError> -- the request, or a 400 error when the target is not an origin-form
+  // path ("/..." or "*") or its path or query has a malformed percent escape. O(size of the target).
+  static tryNew(parts: RequestParts): Result<Request, WebError> {
+    const target = parts.target;
+    if (!target.startsWith("/") && target != "*") {
+      return Err(badRequest("request target must be a path"));
+    }
+    const path = pathOf(target);
+    const segs = decodeSegments(path)?;
+    const q = parseQuery(queryOf(target), PlusAsSpace);
+    if (q.isErr()) {
+      return Err(badRequest("invalid query: " + urlErrorMessage(q.unwrapErr())));
+    }
+    return Ok(
+      new Request(parts.method, target, path, segs, q.unwrap(), parts.headers, parts.body, [], []),
+    );
+  }
+
+  // method(): Method -- the request method (`Get`, `Post`, .. of std:http).
+  method(): Method {
+    return this.reqMethod;
+  }
+
+  // methodText(): string -- the method as written: "GET", "POST", ..
+  methodText(): string {
+    return methodName(this.reqMethod);
+  }
+
+  // target(): string -- the request-target as sent, including the query.
+  target(): string {
+    return this.reqTarget;
+  }
+
+  // path(): string -- the path part of the target, still percent-encoded ("/users/ada%20l").
+  path(): string {
+    return this.reqPath;
+  }
+
+  // segments(): string[] -- the decoded, non-empty path segments: "/users/ada%20l/" is ["users", "ada l"].
+  segments(): string[] {
+    return this.reqSegments;
+  }
+
+  // query(name): Option<string> -- the first value of the query field `name` (decoded; "+" is a space).
+  query(name: string): Option<string> {
+    return findPair(this.reqQuery, name);
+  }
+
+  // queryAll(name): string[] -- every value of the query field `name`, in order.
+  queryAll(name: string): string[] {
+    return allPairs(this.reqQuery, name);
+  }
+
+  // queryPairs(): QueryPair[] -- all query fields in order.
+  queryPairs(): QueryPair[] {
+    return this.reqQuery;
+  }
+
+  // queryInt(name): Result<Option<int>, WebError> -- None when the field is absent, a 400 error when it is not a decimal int.
+  queryInt(name: string): Result<Option<int>, WebError> {
+    const v = findPair(this.reqQuery, name);
+    if (v.isNone()) {
+      return Ok(None);
+    }
+    const n = parseInt(v.unwrap());
+    if (n.isNone()) {
+      return Err(badRequest("query field '" + name + "' must be a whole number"));
+    }
+    return Ok(Some(n.unwrap()));
+  }
+
+  // headers(): Headers -- the request header fields.
+  headers(): Headers {
+    return this.reqHeaders;
+  }
+
+  // header(name): Option<string> -- the first value of a header field (the name is case-insensitive).
+  header(name: string): Option<string> {
+    return this.reqHeaders.get(name);
+  }
+
+  // mediaType(): Option<string> -- the Content-Type without parameters, lower case ("application/json").
+  mediaType(): Option<string> {
+    const ct = this.reqHeaders.get("content-type");
+    if (ct.isNone()) {
+      return None;
+    }
+    const semi = ct.unwrap().indexOf(";");
+    const base = semi.isSome() ? ct.unwrap().substring(0, semi.unwrap()) : ct.unwrap();
+    return Some(toLowerAscii(base.trim()));
+  }
+
+  // bearerToken(): Option<string> -- the token of an `Authorization: Bearer <token>` field (scheme case-insensitive).
+  bearerToken(): Option<string> {
+    const a = this.reqHeaders.get("authorization");
+    if (a.isNone()) {
+      return None;
+    }
+    const v = a.unwrap();
+    if (v.length > 7 && eqIgnoreCase(v.substring(0, 7), "bearer ")) {
+      const t = v.substring(7, v.length).trim();
+      return t.length > 0 ? Some(t) : None;
+    }
+    return None;
+  }
+
+  // body(): Bytes -- the request body (decoded when it was chunked).
+  body(): Bytes {
+    return this.reqBody;
+  }
+
+  // bodyText(): Result<string, WebError> -- the body as text; a 400 error when it is not valid UTF-8.
+  bodyText(): Result<string, WebError> {
+    const s = this.reqBody.toRawString();
+    if (!isValid(s)) {
+      return Err(badRequest("body is not valid UTF-8"));
+    }
+    return Ok(s);
+  }
+
+  // bodyJson(): Result<JsonValue, WebError> -- the body parsed with `std:json` (default limits, duplicate keys rejected);
+  // a 400 error with the parser's message otherwise.
+  bodyJson(): Result<JsonValue, WebError> {
+    const text = this.bodyText()?;
+    const doc = parseDocument(text, defaultReadOptions());
+    if (doc.isErr()) {
+      return Err(badRequest("body is not valid JSON: " + jsonParseErrorMessage(doc.unwrapErr())));
+    }
+    return Ok(doc.unwrap());
+  }
+
+  // param(name): Option<string> -- a path parameter captured by the route ("/users/:id" captures "id"), decoded.
+  param(name: string): Option<string> {
+    return findPair(this.reqParams, name);
+  }
+
+  // paramInt(name): Result<int, WebError> -- a path parameter as a decimal int; a 404 error when it is absent or not a number
+  // (a resource whose id is not a number does not exist).
+  paramInt(name: string): Result<int, WebError> {
+    const v = findPair(this.reqParams, name);
+    if (v.isNone()) {
+      return Err(notFound(""));
+    }
+    const n = parseInt(v.unwrap());
+    if (n.isNone()) {
+      return Err(notFound(""));
+    }
+    return Ok(n.unwrap());
+  }
+
+  // attr(name): Option<string> -- a value an earlier middleware attached with `withAttr` (for example "principal").
+  attr(name: string): Option<string> {
+    return findPair(this.reqAttrs, name);
+  }
+
+  // withAttr(name, value): Request -- a copy with the attribute set (replacing an attribute of the same name).
+  withAttr(name: string, value: string): Request {
+    let kept: QueryPair[] = [];
+    for (const a of this.reqAttrs) {
+      if (a.key != name) {
+        kept.push(a);
+      }
+    }
+    kept.push(QueryPair { key: name, value: value });
+    return new Request(
+      this.reqMethod,
+      this.reqTarget,
+      this.reqPath,
+      this.reqSegments,
+      this.reqQuery,
+      this.reqHeaders,
+      this.reqBody,
+      this.reqParams,
+      kept,
+    );
+  }
+
+  // withParams(params): Request -- a copy with the path parameters replaced (the router does this; a test may too).
+  withParams(params: QueryPair[]): Request {
+    return new Request(
+      this.reqMethod,
+      this.reqTarget,
+      this.reqPath,
+      this.reqSegments,
+      this.reqQuery,
+      this.reqHeaders,
+      this.reqBody,
+      params,
+      this.reqAttrs,
+    );
+  }
+
+  // withBody(body): Request -- a copy with another body (a middleware that decompresses or limits it).
+  withBody(body: Bytes): Request {
+    return new Request(
+      this.reqMethod,
+      this.reqTarget,
+      this.reqPath,
+      this.reqSegments,
+      this.reqQuery,
+      this.reqHeaders,
+      body,
+      this.reqParams,
+      this.reqAttrs,
+    );
+  }
+
+  // withHeader(name, value): Request -- a copy whose field `name` has the single value `value`. Traps when the name or value is
+  // not valid HTTP (control characters, an empty name): meant for middleware and tests that write the value themselves.
+  withHeader(name: string, value: string): Request {
+    let h = this.reqHeaders;
+    h.set(name, value).unwrap();
+    return this.withHeaders(h);
+  }
+
+  // withHeaders(headers): Request -- a copy with other header fields.
+  withHeaders(headers: Headers): Request {
+    return new Request(
+      this.reqMethod,
+      this.reqTarget,
+      this.reqPath,
+      this.reqSegments,
+      this.reqQuery,
+      headers,
+      this.reqBody,
+      this.reqParams,
+      this.reqAttrs,
+    );
+  }
+}

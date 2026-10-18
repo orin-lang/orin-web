@@ -1,0 +1,183 @@
+// The orin-web response: a status, header fields and a body. A response is a value; the `with*` methods return a changed
+// copy. A handler builds one with the static constructors (`Response.text`, `Response.json`, ..).
+//
+// The body is either fixed bytes or a stream (`() => Option<Bytes>`, called until it answers None). Streams carry
+// server-sent events and other long-lived responses; `Response.sse` builds one from events.
+import { Headers, emptyHeaders, HeaderError, standardReason } from "std:http";
+import { Bytes, empty, fromString } from "std:bytes";
+import { JsonValue, writeDocument, defaultLimits, jsonWriteErrorMessage } from "std:json";
+import { WebError, internalError } from "./error";
+import { SseEvent, sseBytes } from "./sse";
+
+export type Body = FixedBody(Bytes) | StreamBody(() => Option<Bytes>);
+
+export class Response {
+  private resStatus: int;
+  private resHeaders: Headers;
+  private resBody: Body;
+
+  // new Response(status, headers, body) -- a status outside 100..599 is stored as 500.
+  constructor(status: int, headers: Headers, body: Body) {
+    this.resStatus = status >= 100 && status <= 599 ? status : 500;
+    this.resHeaders = headers;
+    this.resBody = body;
+  }
+
+  // Response.empty(status) -- no body.
+  static empty(status: int): Response {
+    return new Response(status, emptyHeaders(), FixedBody(empty()));
+  }
+
+  // Response.bytes(status, contentType, body) -- a body of bytes with a Content-Type. An invalid `contentType` (control
+  // characters) is dropped.
+  static bytes(status: int, contentType: string, body: Bytes): Response {
+    return Response.empty(status).withBody(body).withContentType(contentType);
+  }
+
+  // Response.text(status, text) -- `text/plain; charset=utf-8`.
+  static text(status: int, text: string): Response {
+    return Response.bytes(status, "text/plain; charset=utf-8", fromString(text));
+  }
+
+  // Response.html(status, markup) -- `text/html; charset=utf-8`. The markup is sent as is: this is where an orin-ui view
+  // rendered to a string goes.
+  static html(status: int, markup: string): Response {
+    return Response.bytes(status, "text/html; charset=utf-8", fromString(markup));
+  }
+
+  // Response.json(status, value) -- `application/json` through `std:json`. Err (an internal error) when the value exceeds
+  // the writer's limits or holds invalid UTF-8.
+  static json(status: int, value: JsonValue): Result<Response, WebError> {
+    const text = writeDocument(value, defaultLimits());
+    if (text.isErr()) {
+      return Err(internalError("cannot write JSON: " + jsonWriteErrorMessage(text.unwrapErr())));
+    }
+    return Ok(Response.bytes(status, "application/json", fromString(text.unwrap())));
+  }
+
+  // Response.redirect(status, location) -- a redirect (301, 302, 303, 307, 308) to `location`. Err (an internal error) when the
+  // location is not a valid header value.
+  static redirect(status: int, location: string): Result<Response, WebError> {
+    const r = Response.empty(status).tryWithHeader("Location", location);
+    if (r.isErr()) {
+      return Err(internalError("invalid redirect location"));
+    }
+    return Ok(r.unwrap());
+  }
+
+  // Response.stream(status, contentType, next) -- a streamed body: the server calls `next()` until it answers None and sends
+  // each chunk as it comes. `next` may block; it runs on the connection's task.
+  static stream(status: int, contentType: string, next: () => Option<Bytes>): Response {
+    return Response.empty(status).withBodyStream(next).withContentType(contentType);
+  }
+
+  // Response.sse(next) -- a `text/event-stream` response fed by `next()`, which returns the next event or None to end the
+  // stream. The response is not cached and the connection is not reused after it.
+  static sse(next: () => Option<SseEvent>): Response {
+    const chunks = (): Option<Bytes> => {
+      const e = next();
+      return e.isSome() ? Some(sseBytes(e.unwrap())) : None;
+    };
+    return Response
+        .stream(200, "text/event-stream", chunks)
+        .withHeader("Cache-Control", "no-cache");
+  }
+
+  // status(): int -- 100..599.
+  status(): int {
+    return this.resStatus;
+  }
+
+  // reason(): string -- the registered reason phrase of the status.
+  reason(): string {
+    const r = standardReason(this.resStatus);
+    return r.isSome() ? r.unwrap() : "Unknown Status";
+  }
+
+  // headers(): Headers -- the header fields.
+  headers(): Headers {
+    return this.resHeaders;
+  }
+
+  // header(name): Option<string> -- the first value of a header field (case-insensitive name).
+  header(name: string): Option<string> {
+    return this.resHeaders.get(name);
+  }
+
+  // isStream(): bool -- the body is a stream.
+  isStream(): bool {
+    return match (this.resBody) {
+      FixedBody(b) => false,
+      StreamBody(f) => true,
+    };
+  }
+
+  // body(): Body -- the body.
+  body(): Body {
+    return this.resBody;
+  }
+
+  // bodyBytes(): Bytes -- the fixed body; empty for a stream.
+  bodyBytes(): Bytes {
+    return match (this.resBody) {
+      FixedBody(b) => b,
+      StreamBody(f) => empty(),
+    };
+  }
+
+  // bodyText(): string -- the fixed body as a string (bytes as they are).
+  bodyText(): string {
+    return this.bodyBytes().toRawString();
+  }
+
+  // withStatus(status): Response -- a copy with another status.
+  withStatus(status: int): Response {
+    return new Response(status, this.resHeaders, this.resBody);
+  }
+
+  // withBody(body): Response -- a copy with a fixed body. The Content-Length is the server's business.
+  withBody(body: Bytes): Response {
+    return new Response(this.resStatus, this.resHeaders, FixedBody(body));
+  }
+
+  // withBodyStream(next): Response -- a copy with a streamed body.
+  withBodyStream(next: () => Option<Bytes>): Response {
+    return new Response(this.resStatus, this.resHeaders, StreamBody(next));
+  }
+
+  // tryWithHeader(name, value): Result<Response, HeaderError> -- a copy whose field `name` has the single value `value`
+  // (any earlier fields of that name are replaced). Err when the name is not a token or the value has a control character.
+  tryWithHeader(name: string, value: string): Result<Response, HeaderError> {
+    let h = this.resHeaders;
+    const r = h.set(name, value);
+    if (r.isErr()) {
+      return Err(r.unwrapErr());
+    }
+    return Ok(new Response(this.resStatus, h, this.resBody));
+  }
+
+  // withHeader(name, value): Response -- `tryWithHeader` for names and values the program wrote itself; traps when they are
+  // invalid. Use `tryWithHeader` for a value that came from a request.
+  withHeader(name: string, value: string): Response {
+    return this.tryWithHeader(name, value).unwrap();
+  }
+
+  // withAddedHeader(name, value): Response -- a copy with one more field, keeping earlier fields of that name
+  // (`Set-Cookie`, `Vary`). Traps when the name or value is invalid.
+  withAddedHeader(name: string, value: string): Response {
+    let h = this.resHeaders;
+    h.add(name, value).unwrap();
+    return new Response(this.resStatus, h, this.resBody);
+  }
+
+  // withContentType(contentType): Response -- a copy with the Content-Type set; an invalid value leaves it unchanged.
+  withContentType(contentType: string): Response {
+    const r = this.tryWithHeader("Content-Type", contentType);
+    return r.isOk() ? r.unwrap() : this;
+  }
+
+  // withHeaders(headers): Response -- a copy with other header fields.
+  withHeaders(headers: Headers): Response {
+    return new Response(this.resStatus, headers, this.resBody);
+  }
+}

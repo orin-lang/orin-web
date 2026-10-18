@@ -1,0 +1,168 @@
+import { assert, assertEq, assertEqString } from "std:test";
+import {
+  internalError, Router, Request, Response, WebError, TestClient, assertStatus, assertBody,
+  assertHeader,
+} from "../src/module";
+
+function hello(req: Request): Result<Response, WebError> {
+  return Ok(Response.text(200, "hello"));
+}
+
+function showParams(req: Request): Result<Response, WebError> {
+  return Ok(
+    Response.text(200, req.param("id").unwrapOr("-") + "/" + req.param("rest").unwrapOr("-")),
+  );
+}
+
+function named(label: string): (req: Request) => Result<Response, WebError> {
+  return (req: Request): Result<Response, WebError> => Ok(Response.text(200, label));
+}
+
+@Test
+function literalRouteAndNotFound(): void {
+  let app = new Router();
+  app.get("/hello", hello);
+  const c = new TestClient(app);
+  assertBody(c.get("/hello"), "hello");
+  assertStatus(c.get("/hello/"), 200);
+  assertStatus(c.get("/nope"), 404);
+  assertHeader(c.get("/nope"), "Content-Type", "application/json");
+  assertBody(c.get("/nope"), "{\"error\":\"Not Found\",\"status\":404}");
+}
+
+@Test
+function parametersAreCapturedAndDecoded(): void {
+  let app = new Router();
+  app.get("/users/:id", showParams);
+  const c = new TestClient(app);
+  assertBody(c.get("/users/42"), "42/-");
+  assertBody(c.get("/users/a%20b"), "a b/-");
+  assertBody(c.get("/users/a%2Fb"), "a/b/-");
+  assertStatus(c.get("/users"), 404);
+  assertStatus(c.get("/users/1/2"), 404);
+  assertStatus(c.get("/users/%zz"), 400);
+}
+
+@Test
+function wildcardCapturesTheRest(): void {
+  let app = new Router();
+  app.get("/files/*rest", showParams);
+  const c = new TestClient(app);
+  assertBody(c.get("/files/a/b/c.txt"), "-/a/b/c.txt");
+  assertBody(c.get("/files"), "-/");
+}
+
+@Test
+function mostSpecificRouteWins(): void {
+  let app = new Router();
+  app.get("/files/*rest", named("rest"));
+  app.get("/files/:name", named("param"));
+  app.get("/files/readme", named("literal"));
+  app.get("/files", named("end"));
+  const c = new TestClient(app);
+  assertBody(c.get("/files/readme"), "literal");
+  assertBody(c.get("/files/other"), "param");
+  assertBody(c.get("/files/a/b"), "rest");
+  assertBody(c.get("/files"), "end");
+}
+
+@Test
+function firstRegistrationWinsOnEqualShape(): void {
+  let app = new Router();
+  app.get("/a/:x", named("one"));
+  app.get("/a/:y", named("two"));
+  assertBody(new TestClient(app).get("/a/1"), "one");
+}
+
+@Test
+function methodsAnd405(): void {
+  let app = new Router();
+  app.get("/item", named("get"));
+  app.post("/item", named("post"));
+  const c = new TestClient(app);
+  assertBody(c.get("/item"), "get");
+  assertBody(c.post("/item", ""), "post");
+  const r = c.delete("/item");
+  assertStatus(r, 405);
+  assertHeader(r, "Allow", "GET, POST, HEAD, OPTIONS");
+  const o = c.options("/item");
+  assertStatus(o, 204);
+  assertHeader(o, "Allow", "GET, POST, HEAD, OPTIONS");
+}
+
+@Test
+function headFallsBackToGetWithoutBody(): void {
+  let app = new Router();
+  app.get("/item", named("get"));
+  const h = new TestClient(app).head("/item");
+  assertStatus(h, 200);
+  assertEq(h.bodyBytes().length().toInt(), 0, "no body");
+}
+
+@Test
+function mountPrefixesAndKeepsGroupMiddleware(): void {
+  let api = new Router();
+  api.get("/users/:id", showParams);
+  api.use((req: Request, next: (r: Request) => Result<Response, WebError>): Result<Response, WebError> => {
+    const r = next(req);
+    if (r.isOk()) {
+      return Ok(r.unwrap().withHeader("X-Group", "api"));
+    }
+    return r;
+  });
+  let app = new Router();
+  app.get("/health", named("ok"));
+  app.mount("/api/v1/", api);
+  const c = new TestClient(app);
+  const r = c.get("/api/v1/users/9");
+  assertBody(r, "9/-");
+  assertHeader(r, "X-Group", "api");
+  assertStatus(c.get("/users/9"), 404);
+  assert(!c.get("/health").headers().has("X-Group"), "group middleware stays in the group");
+  assertEqString(app.patterns().join(","), "GET /health,GET /api/v1/users/:id", "patterns");
+}
+
+@Test
+function mountPrefixMayHaveParameters(): void {
+  let sub = new Router();
+  sub.get("/members/:id", showParams);
+  let app = new Router();
+  app.mount("/orgs/:org", sub);
+  assertBody(new TestClient(app).get("/orgs/acme/members/7"), "7/-");
+}
+
+@Test
+function customNotFoundAndErrorHandlers(): void {
+  let app = new Router();
+  app.onNotFound(
+    (req: Request): Result<Response, WebError> => Ok(Response.text(404, "custom: " + req.path())),
+  );
+  app.get("/boom", (req: Request): Result<Response, WebError> => Err(internalError("x")));
+  app.onError((req: Request, e: WebError): Response => Response.text(599, "handled"));
+  const c = new TestClient(app);
+  assertBody(c.get("/zzz"), "custom: /zzz");
+  assertStatus(c.get("/boom"), 599);
+}
+
+@Test
+function middlewareOrderIsOutermostFirst(): void {
+  let app = new Router();
+  app.use((req: Request, next: (r: Request) => Result<Response, WebError>): Result<Response, WebError> => {
+    const r = next(req.withAttr("trace", req.attr("trace").unwrapOr("") + "A"));
+    return Ok(r.unwrap().withHeader("X-A", "1"));
+  });
+  app.use(
+    (req: Request, next: (r: Request) => Result<Response, WebError>): Result<Response, WebError> => next(
+      req.withAttr("trace", req.attr("trace").unwrapOr("") + "B"),
+    ),
+  );
+  app.get(
+    "/t",
+    (req: Request): Result<Response, WebError> => Ok(
+      Response.text(200, req.attr("trace").unwrapOr("?")),
+    ),
+  );
+  const r = new TestClient(app).get("/t");
+  assertBody(r, "AB");
+  assertHeader(r, "X-A", "1");
+}

@@ -1,0 +1,35 @@
+// Small constructors for `std:json` values, so a handler can write
+//   jsonObject([jsonMember("id", jsonInt(7)), jsonMember("name", jsonString("ada"))])
+// instead of spelling out `ValueObject([JsonMember { .. }])` and `numberFromInt`.
+import {
+  JsonValue, JsonMember, ValueNull, ValueBool, ValueNumber, ValueString, ValueArray, ValueObject,
+} from "std:json";
+import { numberFromInt } from "std:json/number";
+
+export function jsonMember(key: string, value: JsonValue): JsonMember {
+  return JsonMember { key: key, value: value };
+}
+
+export function jsonObject(members: JsonMember[]): JsonValue {
+  return ValueObject(members);
+}
+
+export function jsonArray(items: JsonValue[]): JsonValue {
+  return ValueArray(items);
+}
+
+export function jsonString(s: string): JsonValue {
+  return ValueString(s);
+}
+
+export function jsonInt(n: int): JsonValue {
+  return ValueNumber(numberFromInt(n));
+}
+
+export function jsonBool(b: bool): JsonValue {
+  return ValueBool(b);
+}
+
+export function jsonNull(): JsonValue {
+  return ValueNull;
+}

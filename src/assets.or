@@ -1,0 +1,83 @@
+// Static responses. orin-web serves content that is part of the program: a fixed response (`staticResponse`) and a set of named
+// assets (`assetsHandler`), for example files embedded as strings or built by the program.
+//
+// Serving files from a directory is not here on purpose: it needs a file-system grant, and a grant is a resource handle that a
+// closure (a `Handler`) cannot capture (E0452). A program that wants it reads the files in `main` (it has the grant there) and
+// passes the bytes in as assets.
+import { Bytes, fromString } from "std:bytes";
+import { toLowerAscii } from "std:http";
+import { WebError, notFound } from "./error";
+import { Request } from "./request";
+import { Response } from "./response";
+import { Handler } from "./router";
+
+export type Asset = { path: string; contentType: string; body: Bytes; };
+
+// contentTypeFor(path): string -- the media type for a file name by its extension (case-insensitive); "application/octet-stream" for
+// an unknown one. Text types carry `charset=utf-8`.
+export function contentTypeFor(path: string): string {
+  const parts = path.split(".");
+  if (parts.length < 2) {
+    return "application/octet-stream";
+  }
+  const ext = toLowerAscii(parts[parts.length - 1]);
+  return match (ext) {
+    "html" => "text/html; charset=utf-8",
+    "htm" => "text/html; charset=utf-8",
+    "css" => "text/css; charset=utf-8",
+    "js" => "text/javascript; charset=utf-8",
+    "mjs" => "text/javascript; charset=utf-8",
+    "json" => "application/json",
+    "txt" => "text/plain; charset=utf-8",
+    "md" => "text/markdown; charset=utf-8",
+    "xml" => "application/xml",
+    "svg" => "image/svg+xml",
+    "png" => "image/png",
+    "jpg" => "image/jpeg",
+    "jpeg" => "image/jpeg",
+    "gif" => "image/gif",
+    "webp" => "image/webp",
+    "ico" => "image/x-icon",
+    "wasm" => "application/wasm",
+    "woff2" => "font/woff2",
+    "pdf" => "application/pdf",
+    _ => "application/octet-stream",
+  };
+}
+
+// textAsset(path, text): Asset -- an asset from a string; the type comes from the extension of `path`.
+export function textAsset(path: string, text: string): Asset {
+  return Asset { path: path, contentType: contentTypeFor(path), body: fromString(text) };
+}
+
+// bytesAsset(path, body): Asset -- an asset from bytes; the type comes from the extension of `path`.
+export function bytesAsset(path: string, body: Bytes): Asset {
+  return Asset { path: path, contentType: contentTypeFor(path), body: body };
+}
+
+// staticResponse(res): Handler -- a handler that always answers `res`.
+export function staticResponse(res: Response): Handler {
+  return (req: Request): Result<Response, WebError> => Ok(res);
+}
+
+// assetsHandler(assets, index, cacheControl): Handler -- for a route with a wildcard named "path" ("/static/*path"): answers the
+// asset whose path equals the captured path, `index` for an empty one (use "" for none), 404 otherwise. `cacheControl`
+// ("" = no field) is sent as `Cache-Control`. Only GET and HEAD routes should use it.
+export function assetsHandler(assets: Asset[], index: string, cacheControl: string): Handler {
+  return (req: Request): Result<Response, WebError> => {
+    let want = req.param("path").unwrapOr("");
+    if (want.length == 0) {
+      want = index;
+    }
+    for (const a of assets) {
+      if (a.path == want) {
+        let res = Response.bytes(200, a.contentType, a.body);
+        if (cacheControl.length > 0) {
+          res = res.withHeader("Cache-Control", cacheControl);
+        }
+        return Ok(res);
+      }
+    }
+    return Err(notFound(""));
+  };
+}

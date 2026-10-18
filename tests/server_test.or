@@ -1,0 +1,196 @@
+// End-to-end tests over real loopback sockets: the server runs in a task, the test is the client.
+import { assert, assertEq, assertEqString } from "std:test";
+import { Host, withNet } from "std:host";
+import { milliseconds } from "std:time";
+import { Scope, scopeNet, spawnNet, channel } from "std:task";
+import { Bytes, fromString } from "std:bytes";
+import { NetGrant, Stream, withConnection, recv, sendAll } from "std:net";
+import {
+  Router, Request, Response, WebError, ServerConfig, ServerHandle, defaultServerConfig, serve,
+  sseData, sseEvent, SseEvent, internalError,
+} from "../src/module";
+
+function buildApp(): Router {
+  let app = new Router();
+  app.get("/hello", (req: Request): Result<Response, WebError> => Ok(Response.text(200, "hello")));
+  app.get(
+    "/users/:id",
+    (req: Request): Result<Response, WebError> => Ok(
+      Response.text(200, "user " + req.param("id").unwrapOr("?")),
+    ),
+  );
+  app.post(
+    "/echo",
+    (req: Request): Result<Response, WebError> => Ok(
+      Response.bytes(200, "application/octet-stream", req.body()),
+    ),
+  );
+  app.get("/boom", (req: Request): Result<Response, WebError> => Err(internalError("kaput")));
+  app.get(
+    "/events",
+    (req: Request): Result<Response, WebError> => {
+      const ch = channel<SseEvent>(8);
+      ch.tx.send(sseData("one"));
+      ch.tx.send(sseEvent("tick", "two\nlines"));
+      ch.tx.close();
+      const rx = ch.rx;
+      return Ok(Response.sse(() => rx.recv()));
+    },
+  );
+  return app;
+}
+
+function readAll(c: Stream): string {
+  let all = fromString("");
+  let going = true;
+  while (going) {
+    const r = recv(c, 65536, milliseconds(3000));
+    match (r) {
+      Ok(b) => {
+        all = all.concat(b);
+      },
+      Err(e) => {
+        going = false;
+      },
+    }
+  }
+  return all.toRawString();
+}
+
+// Sends `raw` on a new connection and reads until the server closes it.
+function fetch(g: NetGrant, port: int, raw: string): string {
+  const r = withConnection(
+    g,
+    "127.0.0.1",
+    port,
+    milliseconds(2000),
+    (c: Stream): string => {
+      sendAll(c, fromString(raw), milliseconds(2000));
+      return readAll(c);
+    },
+  );
+  return r.isOk() ? r.unwrap() : "connect error";
+}
+
+function req(method: string, target: string, extra: string, body: string): string {
+  return method + " " + target + " HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n" + extra
+      + (body.length > 0 ? "Content-Length: " + body.length.toString() + "\r\n" : "") + "\r\n"
+      + body;
+}
+
+// Runs `app` on a free port and calls `client(g, port)` against it; returns the client's result.
+function withServer<T>(host: Host, app: Router, client: (g: NetGrant, port: int) => T): T {
+  const out = withNet(
+    host,
+    net => {
+      return scopeNet(
+        net,
+        (s: Scope, g: NetGrant): T => {
+          const ch = channel<ServerHandle>(1);
+          const tx = ch.tx;
+          const cfg = ServerConfig { ...defaultServerConfig(), port: 0, workers: 2, queue: 4 };
+          const server = spawnNet(
+            s,
+            g,
+            (sg: NetGrant) => serve(
+              sg,
+              app,
+              cfg,
+              (h: ServerHandle) => {
+                tx.send(h);
+              },
+            ),
+          );
+          const handle = ch.rx.recv().unwrap();
+          const result = client(g, handle.port);
+          handle.stop.cancel();
+          assert(server.join().isOk(), "server ended cleanly");
+          return result;
+        },
+      );
+    },
+  );
+  return out;
+}
+
+@Test
+function servesRoutesOverTcp(host: Host): void {
+  const text = withServer(
+    host,
+    buildApp(),
+    (g: NetGrant, port: int): string[] => {
+      return [
+        fetch(g, port, req("GET", "/hello", "", "")),
+        fetch(g, port, req("GET", "/users/a%20b?x=1", "", "")),
+        fetch(g, port, req("GET", "/missing", "", "")),
+        fetch(g, port, req("POST", "/echo", "", "payload")),
+        fetch(g, port, req("HEAD", "/hello", "", "")),
+        fetch(g, port, req("GET", "/boom", "", "")),
+        fetch(g, port, req("DELETE", "/hello", "", "")),
+      ];
+    },
+  );
+  assert(text[0].startsWith("HTTP/1.1 200 OK\r\n"), "status line");
+  assert(text[0].includes("Content-Type: text/plain; charset=utf-8\r\n"), "content type");
+  assert(text[0].includes("Content-Length: 5\r\n"), "length");
+  assert(text[0].endsWith("\r\n\r\nhello"), "body");
+  assert(text[1].endsWith("\r\n\r\nuser a b"), "decoded param");
+  assert(text[2].startsWith("HTTP/1.1 404 Not Found\r\n"), "404");
+  assert(text[2].endsWith("{\"error\":\"Not Found\",\"status\":404}"), "404 body");
+  assert(text[3].endsWith("\r\n\r\npayload"), "echo");
+  assert(text[4].startsWith("HTTP/1.1 200 OK\r\n"), "head status");
+  assert(text[4].includes("Content-Length: 5\r\n"), "head keeps the length");
+  assert(text[4].endsWith("\r\n\r\n"), "head has no body");
+  assert(text[5].startsWith("HTTP/1.1 500 Internal Server Error\r\n"), "500");
+  assert(text[6].startsWith("HTTP/1.1 405 Method Not Allowed\r\n"), "405");
+  assert(text[6].includes("Allow: GET, HEAD, OPTIONS\r\n"), "allow");
+}
+
+@Test
+function keepAliveServesTwoRequestsOnOneConnection(host: Host): void {
+  const text = withServer(
+    host,
+    buildApp(),
+    (g: NetGrant, port: int): string => {
+      const two = "GET /hello HTTP/1.1\r\nHost: x\r\n\r\n" + req("GET", "/users/9", "", "");
+      return fetch(g, port, two);
+    },
+  );
+  assert(text.includes("hello"), "first answer");
+  assert(text.includes("user 9"), "second answer");
+}
+
+@Test
+function malformedRequestsAreRefused(host: Host): void {
+  const text = withServer(
+    host,
+    buildApp(),
+    (g: NetGrant, port: int): string[] => {
+      return [
+        fetch(g, port, "GET /hello HTTP/1.1\r\n\r\n"),
+        fetch(g, port, req("GET", "/users/%zz", "", "")),
+        fetch(g, port, "NOT A REQUEST\r\n\r\n"),
+      ];
+    },
+  );
+  assert(text[0].startsWith("HTTP/1.1 400 Bad Request\r\n"), "no Host");
+  assert(text[1].startsWith("HTTP/1.1 400 Bad Request\r\n"), "bad escape");
+  assert(text[2].startsWith("HTTP/1.1 400 Bad Request\r\n"), "garbage");
+}
+
+@Test
+function streamsServerSentEvents(host: Host): void {
+  const text = withServer(
+    host,
+    buildApp(),
+    (g: NetGrant, port: int): string => {
+      return fetch(g, port, req("GET", "/events", "", ""));
+    },
+  );
+  assert(text.startsWith("HTTP/1.1 200 OK\r\n"), "status");
+  assert(text.includes("Content-Type: text/event-stream\r\n"), "type");
+  assert(text.includes("Transfer-Encoding: chunked\r\n"), "chunked");
+  assert(text.includes("data: one\n\n"), "first event");
+  assert(text.includes("event: tick\ndata: two\ndata: lines\n\n"), "second event");
+  assert(text.endsWith("0\r\n\r\n"), "last chunk");
+}
