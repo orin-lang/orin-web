@@ -1,0 +1,15 @@
+// expect: C.both has 2 route annotations; a method is one route
+import { Controller, Get, Post } from "orin-web";
+
+@Controller("/x")
+export class C {
+  constructor(public n: int) {}
+  static create(n: int): C {
+    return new C(n);
+  }
+  @Get("/")
+  @Post("/")
+  both(): string {
+    return "x";
+  }
+}

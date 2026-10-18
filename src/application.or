@@ -1,0 +1,44 @@
+// `@Application`: marks the module that holds both the services and the controllers of an application and asks for `buildApp`.
+//
+//   @Application export type TodoApp = {};
+//
+// generates, next to what @Service and @Controller generate for the same module,
+//
+//   export function buildApp(deps: ServicesDeps, mws: Middlewares): Router
+//
+// which creates the services (`buildServices`), injects them into the controllers and registers their routes
+// (`registerControllersFrom`). It needs at least one @Service and one @Controller in the module, and controllers that depend on
+// services of the module only; an application that spreads services and controllers over several modules wires the generated pieces
+// of each module by hand (docs/design.md, "Several modules"), because a module cannot import the generated code of another one.
+import {
+  Input, Output, MDecl, named, param, fn, ret, constS, name, call, exportDecl, output, withImports,
+  withDiagnostics, diagError, importFrom,
+} from "std:meta";
+import { WEB_MODULE } from "./metautil";
+
+@Annotation(type)
+export type Application = {};
+
+@Processor(Application)
+export function applicationProc(input: Input): Output {
+  if (input.decls.length > 1) {
+    return withDiagnostics(
+      output([]),
+      [diagError(input.decls[1].ref, "a module has one @Application")],
+    );
+  }
+  const body = [
+    constS("services", call("buildServices", [name("deps")])),
+    ret(call("registerControllersFrom", [call("newRouter", []), name("services"), name("mws")])),
+  ];
+  const f = fn(
+    "buildApp",
+    [param("deps", named("ServicesDeps")), param("mws", named("Middlewares"))],
+    named("Router"),
+    body,
+  );
+  return withImports(
+    output([exportDecl(f, true)]),
+    [importFrom(["Router", "Middlewares", "newRouter"], WEB_MODULE)],
+  );
+}

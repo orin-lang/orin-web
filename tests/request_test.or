@@ -1,0 +1,88 @@
+import { assert, assertEq, assertEqString, assertEqUsize } from "std:test";
+import { Get, Post, emptyHeaders } from "std:http";
+import { fromString, empty } from "std:bytes";
+import { ValueObject, ValueString, JsonMember } from "std:json";
+import { Request, RequestParts, testRequest, webErrorStatus } from "../src/module";
+
+@Test
+function pathAndQuery(): void {
+  const r = testRequest(Get, "/a/b%20c/?x=1&y=two+words&x=3&flag&e=%C3%A9#frag");
+  assertEqString(r.path(), "/a/b%20c/", "raw path");
+  assertEqString(r.segments().join("|"), "a|b c", "decoded segments");
+  assertEqString(r.query("x").unwrapOr("-"), "1", "first value");
+  assertEqString(r.queryAll("x").join(","), "1,3", "all values");
+  assertEqString(r.query("y").unwrapOr("-"), "two words", "plus is a space in a query");
+  assertEqString(r.query("flag").unwrapOr("-"), "", "bare key");
+  assertEqString(r.query("e").unwrapOr("-"), "é", "utf-8 value");
+  assert(r.query("none").isNone(), "absent");
+  assertEqString(r.methodText(), "GET", "method");
+}
+
+@Test
+function queryInt(): void {
+  const r = testRequest(Get, "/?n=12&bad=x1");
+  assertEq(r.queryInt("n").unwrap().unwrap(), 12, "number");
+  assert(r.queryInt("none").unwrap().isNone(), "absent is Ok(None)");
+  assertEq(webErrorStatus(r.queryInt("bad").unwrapErr()), 400, "not a number");
+}
+
+@Test
+function invalidTargetsAreRejected(): void {
+  const parts = (t: string): RequestParts => RequestParts {
+    method: Get,
+    target: t,
+    headers: emptyHeaders(),
+    body: empty(),
+  };
+  assertEq(webErrorStatus(Request.tryNew(parts("/a%zz")).unwrapErr()), 400, "bad escape in path");
+  assertEq(webErrorStatus(Request.tryNew(parts("/a?x=%")).unwrapErr()), 400, "bad escape in query");
+  assertEq(webErrorStatus(Request.tryNew(parts("a/b")).unwrapErr()), 400, "not a path");
+  assert(Request.tryNew(parts("*")).isOk(), "asterisk-form");
+  assert(Request.tryNew(parts("/")).isOk(), "root");
+}
+
+@Test
+function headersAndBearer(): void {
+  const r = testRequest(Get, "/")
+      .withHeader("Content-Type", "Application/JSON; charset=utf-8")
+      .withHeader("Authorization", "Bearer   abc123");
+  assertEqString(
+    r.header("content-type").unwrapOr("-"),
+    "Application/JSON; charset=utf-8",
+    "case-insensitive lookup",
+  );
+  assertEqString(r.mediaType().unwrapOr("-"), "application/json", "media type");
+  assertEqString(r.bearerToken().unwrapOr("-"), "abc123", "token");
+  assert(testRequest(Get, "/").bearerToken().isNone(), "no authorization");
+  assert(
+    testRequest(Get, "/").withHeader("Authorization", "Basic x").bearerToken().isNone(),
+    "other scheme",
+  );
+}
+
+@Test
+function bodyAccessors(): void {
+  const r = testRequest(Post, "/").withBody(fromString("{\"name\":\"ada\"}"));
+  assertEqString(r.bodyText().unwrap(), "{\"name\":\"ada\"}", "text");
+  const j = r.bodyJson().unwrap();
+  assert(j == ValueObject([JsonMember { key: "name", value: ValueString("ada") }]), "json");
+  assertEq(
+    webErrorStatus(testRequest(Post, "/").withBody(fromString("{")).bodyJson().unwrapErr()),
+    400,
+    "bad json",
+  );
+  assertEq(
+    webErrorStatus(testRequest(Post, "/").withBody(fromString("\xff")).bodyText().unwrapErr()),
+    400,
+    "bad utf-8",
+  );
+}
+
+@Test
+function attributesAndParamsAreCopies(): void {
+  const a = testRequest(Get, "/");
+  const b = a.withAttr("who", "ann").withAttr("who", "bob");
+  assert(a.attr("who").isNone(), "original unchanged");
+  assertEqString(b.attr("who").unwrapOr("-"), "bob", "replaced");
+  assertEqUsize(b.queryPairs().length, 0, "no query");
+}

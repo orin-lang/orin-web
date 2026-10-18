@@ -1,0 +1,15 @@
+// expect: parameter `ratio` has type float, which cannot be read from a query
+import { Controller, Get, Query } from "orin-web";
+
+@Controller("/x")
+export class C {
+  constructor(public n: int) {}
+  static create(n: int): C {
+    return new C(n);
+  }
+  @Get("/")
+  @Query("ratio")
+  list(ratio: float): string {
+    return "x";
+  }
+}

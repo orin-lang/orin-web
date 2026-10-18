@@ -1,0 +1,81 @@
+// orin-web: a web framework library for Orin. This file is the public face of the package: `import { Router } from "orin-web";`.
+// Everything not listed here is private to the package (MOD-4).
+
+// Errors: handlers return `Result<Response, WebError>`.
+export {
+  WebErrorKind, WebError, webErrorStatus, webErrorMessage, webError, withErrorHeader, badRequest,
+  unauthorized, forbidden, notFound, unprocessable, internalError, statusError,
+} from "./error";
+
+// Requests and responses.
+export { Request, RequestParts, decodeBody, decodeBodyWith } from "./request";
+export { Response, ResponseBody, FixedBody, StreamBody } from "./response";
+export {
+  jsonMember, jsonObject, jsonArray, jsonString, jsonInt, jsonBool, jsonNull,
+} from "./jsonbuild";
+
+// Server-sent events.
+export {
+  SseEvent, sseData, sseEvent, sseEncode, sseComment, sseBytes, parseSseEvents,
+} from "./sse";
+
+// Routing.
+export {
+  Router, Handler, Middleware, ErrorHandler, withMiddleware, chain, defaultErrorResponse,
+} from "./router";
+
+// Middleware.
+export {
+  logger, recover, bearerAuth, bearerToken, constantTimeEquals, limitBody, CorsConfig, defaultCors,
+  cors,
+} from "./middleware";
+
+// Static responses.
+export {
+  Asset, contentTypeFor, textAsset, bytesAsset, staticResponse, assetsHandler,
+} from "./assets";
+
+// Testing without a socket.
+export {
+  TestClient, testRequest, readStream, readEvents, assertStatus, assertBody, assertHeader,
+  assertNoHeader,
+} from "./testing";
+
+// The server (needs a NetGrant).
+export { ServerConfig, ServerHandle, defaultServerConfig, serve } from "./server";
+
+// Annotation layer: runtime support of the generated code.
+export {
+  bindPathString, bindPathInt, bindPathBool, bindQueryString, bindQueryInt, bindQueryBool,
+  bindQueryStringOpt, bindQueryIntOpt, bindQueryBoolOpt, bindQueryStrings, bindQueryInts,
+  bindHeader, bindHeaderInt, bindHeaderBool, bindHeaderOpt, bindHeaderIntOpt, bindHeaderBoolOpt,
+} from "./bind";
+export {
+  respondValue, respondResult, respondOption, respondResultOption, respondResponse, respondUnit,
+  respondResultUnit,
+} from "./respond";
+export {
+  encArray, encOption, jsonPassthrough, decStr, decInt, decBool, decArr, decField, decFieldOpt,
+  decEnum,
+} from "./codec";
+export {
+  Middlewares, newMiddlewares, newRouter, wireController, useAll, useGroup, addRoute, mountGroup,
+} from "./wiring";
+
+// Annotations (the processors live next to them).
+export { Service } from "./service";
+export { Controller } from "./controller";
+export { Application } from "./application";
+export {
+  Get, Post, Put, Patch, Delete, Status, Path, Query, Header, Body, Use, Auth,
+} from "./annotations";
+
+// Processor internals, exported so that the tests can call the processors as functions. Not API: they may change in any release.
+export { serviceProc, resolveServices, Bean, Resolution } from "./service";
+export {
+  controllerProc, planControllers, Plan, routeOf, pathParams, bindMethod, Bound, bindFunction,
+  Binding, RouteSpec,
+} from "./controller";
+export { applicationProc } from "./application";
+export { Ctx, Gen, Got, newGen, encoderFor, decoderFor, importsOf } from "./gen_codec";
+export { typeKey, plainName, lowerCamel, splitList, upper } from "./metautil";

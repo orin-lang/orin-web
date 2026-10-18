@@ -1,0 +1,136 @@
+// Server-sent events (the `text/event-stream` format of the WHATWG HTML standard, section 9.2).
+//
+// An event stream is a response whose body never has a length: the server writes events as they happen. orin-web models
+// the body as a PULL source, `() => Option<SseEvent>`: the server calls it, it may block (typically on `rx.recv()` of a
+// channel), and `None` ends the stream. A closure can capture a channel end, so a producer task and the stream meet at a
+// `std:task` channel; nothing else is shared (Orin tasks share no mutable state).
+import { Bytes, fromString } from "std:bytes";
+
+// event: the event type ("message" when None); data: the payload, any number of lines; id: the last-event-id the client
+// sends back when it reconnects; retry: the reconnection delay the client should use, in milliseconds.
+export type SseEvent = {
+  event: Option<string>;
+  data: string;
+  id: Option<string>;
+  retry: Option<int>;
+};
+
+// sseData(data): SseEvent -- a plain `message` event.
+export function sseData(data: string): SseEvent {
+  return SseEvent { event: None, data: data, id: None, retry: None };
+}
+
+// sseEvent(name, data): SseEvent -- an event with a type.
+export function sseEvent(name: string, data: string): SseEvent {
+  return SseEvent { event: Some(name), data: data, id: None, retry: None };
+}
+
+// A field value is one line: CR and LF would end it early (and let a payload forge fields), so they are dropped.
+function oneLine(s: string): string {
+  let out = "";
+  let i: usize = 0;
+  while (i < s.length) {
+    const c = s.charCodeAt(i);
+    if (c != 10 && c != 13) {
+      out += s.charAt(i);
+    }
+    i += 1;
+  }
+  return out;
+}
+
+// The lines of a payload: LF, CRLF and CR all end a line.
+function dataLines(s: string): string[] {
+  let lines: string[] = [];
+  let cur = "";
+  let i: usize = 0;
+  while (i < s.length) {
+    const c = s.charCodeAt(i);
+    if (c == 13) {
+      lines.push(cur);
+      cur = "";
+      if (i + 1 < s.length && s.charCodeAt(i + 1) == 10) {
+        i += 1;
+      }
+    } else if (c == 10) {
+      lines.push(cur);
+      cur = "";
+    } else {
+      cur += s.charAt(i);
+    }
+    i += 1;
+  }
+  lines.push(cur);
+  return lines;
+}
+
+// sseEncode(e): string -- the wire form of an event: `event:`, `id:`, `retry:` fields, one `data:` line per line of the
+// payload, and the blank line that ends the event. CR and LF in `event` and `id` are dropped. O(size).
+export function sseEncode(e: SseEvent): string {
+  let out = "";
+  if (e.event.isSome()) {
+    out += "event: " + oneLine(e.event.unwrap()) + "\n";
+  }
+  if (e.id.isSome()) {
+    out += "id: " + oneLine(e.id.unwrap()) + "\n";
+  }
+  if (e.retry.isSome() && e.retry.unwrap() >= 0) {
+    out += "retry: " + e.retry.unwrap().toString() + "\n";
+  }
+  for (const line of dataLines(e.data)) {
+    out += "data: " + line + "\n";
+  }
+  return out + "\n";
+}
+
+// sseComment(text): string -- a comment line, which clients ignore: the usual keep-alive that stops proxies from closing an
+// idle stream. Not an event; a producer that wants it must write it through `Response.stream`.
+export function sseComment(text: string): string {
+  return ": " + oneLine(text) + "\n\n";
+}
+
+// sseBytes(e): Bytes -- `sseEncode` as bytes.
+export function sseBytes(e: SseEvent): Bytes {
+  return fromString(sseEncode(e));
+}
+
+// parseSseEvents(text): SseEvent[] -- the events of a received stream (what a test reads back). Comment lines and unknown
+// fields are skipped; an event without `data` lines is not delivered; the final `\n` of the payload is removed, as the standard
+// says.
+export function parseSseEvents(text: string): SseEvent[] {
+  let events: SseEvent[] = [];
+  let ev: Option<string> = None;
+  let id: Option<string> = None;
+  let retry: Option<int> = None;
+  let data = "";
+  let hasData = false;
+  for (const raw of dataLines(text)) {
+    if (raw.length == 0) {
+      if (hasData) {
+        events.push(SseEvent { event: ev, data: data, id: id, retry: retry });
+      }
+      ev = None;
+      retry = None;
+      data = "";
+      hasData = false;
+    } else if (!raw.startsWith(":")) {
+      const colon = raw.indexOf(":");
+      const name = colon.isSome() ? raw.substring(0, colon.unwrap()) : raw;
+      let value = colon.isSome() ? raw.substring(colon.unwrap() + 1, raw.length) : "";
+      if (value.startsWith(" ")) {
+        value = value.substring(1, value.length);
+      }
+      if (name == "event") {
+        ev = Some(value);
+      } else if (name == "id") {
+        id = Some(value);
+      } else if (name == "retry") {
+        retry = parseInt(value);
+      } else if (name == "data") {
+        data = hasData ? data + "\n" + value : value;
+        hasData = true;
+      }
+    }
+  }
+  return events;
+}

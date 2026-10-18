@@ -1,0 +1,71 @@
+// Turning a controller method's return value into a response: what the generated code calls. A value is written as JSON with the
+// encoder the processor generated for its type.
+import { JsonValue } from "std:json";
+import { WebError, notFound } from "./error";
+import { Response } from "./response";
+
+// respondValue(status, v, enc) -- `v` as a JSON response.
+export function respondValue<T>(
+  status: int,
+  v: T,
+  enc: (x: T) => JsonValue,
+): Result<Response, WebError> {
+  return Response.json(status, enc(v));
+}
+
+// respondResult(status, r, enc) -- the JSON of `Ok`, or the error as is.
+export function respondResult<T>(
+  status: int,
+  r: Result<T, WebError>,
+  enc: (x: T) => JsonValue,
+): Result<Response, WebError> {
+  if (r.isErr()) {
+    return Err(r.unwrapErr());
+  }
+  return Response.json(status, enc(r.unwrap()));
+}
+
+// respondOption(status, o, enc) -- `None` is a 404.
+export function respondOption<T>(
+  status: int,
+  o: Option<T>,
+  enc: (x: T) => JsonValue,
+): Result<Response, WebError> {
+  if (o.isNone()) {
+    return Err(notFound(""));
+  }
+  return Response.json(status, enc(o.unwrap()));
+}
+
+// respondResultOption(status, r, enc) -- the error, a 404 for `Ok(None)`, else the JSON.
+export function respondResultOption<T>(
+  status: int,
+  r: Result<Option<T>, WebError>,
+  enc: (x: T) => JsonValue,
+): Result<Response, WebError> {
+  if (r.isErr()) {
+    return Err(r.unwrapErr());
+  }
+  return respondOption(status, r.unwrap(), enc);
+}
+
+// respondResponse(r) -- a method that builds its own `Response`.
+export function respondResponse(r: Response): Result<Response, WebError> {
+  return Ok(r);
+}
+
+// respondUnit(status) -- a method that returns nothing: an empty response (204 unless `@Status` says otherwise).
+export function respondUnit(status: int): Result<Response, WebError> {
+  return Ok(Response.empty(status));
+}
+
+// respondResultUnit(r, status) -- the error of a `Result<void, WebError>`, else an empty response.
+export function respondResultUnit(
+  r: Result<void, WebError>,
+  status: int,
+): Result<Response, WebError> {
+  if (r.isErr()) {
+    return Err(r.unwrapErr());
+  }
+  return Ok(Response.empty(status));
+}

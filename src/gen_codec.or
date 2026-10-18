@@ -1,0 +1,352 @@
+// Processor side of the JSON codecs: from the shape of a type (as `std:meta` lists it) to generated encoder and decoder functions.
+//
+// Supported types: `string`, `int`, `bool`, `JsonValue`, `T[]`, `Option<T>` (as a record field or at top level for encoding), records
+// whose fields are supported (nested records may live in other modules), unions of tags (written as their name), and aliases of
+// supported types. Everything else (floats, classes, generic types, unions with payloads, `Option` inside arrays) is a diagnostic at
+// the declaration that mentions it.
+//
+// The functions are pure and thread their state (`Gen`) through the calls, because a processor cannot mutate shared state.
+import {
+  MType, MNamed, MArray, MOption, MTypeShape, MSRecord, MSUnion, MSAlias, MSOpaque, MFieldView,
+  MVariant, MDecl, MDiagnostic, MImport, MRef, MStmt, MExpr, MFieldInit, MParam, fresh, named,
+  resultOf, arrayOf, fn, param, ret, constS, exprS, name, call, callExpr, dot, str, arrayLit, tryOp,
+  record, initField, matchExpr, arm, pVariant, ifS, eq, importFrom, diagError,
+} from "std:meta";
+import { typeKey, identOf, plainName, findShape, uniqueSorted } from "./metautil";
+
+// Where a type is mentioned: the module's type table and the declaration to blame.
+export type Ctx = { types: MTypeShape[]; modulePath: string; at: MRef; where: string; };
+
+// base: the NameGen base of the run; counter: names handed out; memo: ("e:"/"d:" + type key) -> generated function name;
+// decls: the generated helpers; web, decode, json: names to import from orin-web, std:json/decode, std:json; imports: record types
+// that live in other modules; problems: diagnostics.
+export type Gen = {
+  base: int;
+  counter: int;
+  memo: string[];
+  memoNames: string[];
+  decls: MDecl[];
+  web: string[];
+  decode: string[];
+  json: string[];
+  imports: MImport[];
+  problems: MDiagnostic[];
+};
+
+export function newGen(base: int): Gen {
+  return Gen {
+    base: base,
+    counter: 0,
+    memo: [],
+    memoNames: [],
+    decls: [],
+    web: [],
+    decode: [],
+    json: [],
+    imports: [],
+    problems: [],
+  };
+}
+
+export type Got = { gen: Gen; fnName: string; };
+
+function withProblem(g: Gen, ctx: Ctx, text: string): Gen {
+  let ps = g.problems;
+  ps.push(diagError(ctx.at, ctx.where + ": " + text));
+  return Gen { ...g, problems: ps };
+}
+
+function useWeb(g: Gen, n: string): Gen {
+  let w = g.web;
+  w.push(n);
+  return Gen { ...g, web: w };
+}
+
+function useDecode(g: Gen, names: string[]): Gen {
+  let w = g.decode;
+  for (const n of names) {
+    w.push(n);
+  }
+  return Gen { ...g, decode: w };
+}
+
+function useJson(g: Gen): Gen {
+  let w = g.json;
+  w.push("JsonValue");
+  return Gen { ...g, json: w };
+}
+
+function memoIndex(g: Gen, key: string): int {
+  let i: usize = 0;
+  while (i < g.memo.length) {
+    if (g.memo[i] == key) {
+      return i.toInt();
+    }
+    i += 1;
+  }
+  return -1;
+}
+
+// Reserves the name of a helper before its body is generated, so that a type that contains itself finds it.
+function reserve(g: Gen, key: string, label: string): Got {
+  const n = fresh(label + "_" + identOf(key), g.base + g.counter);
+  let m = g.memo;
+  m.push(key);
+  let ms = g.memoNames;
+  ms.push(n);
+  return Got { gen: Gen { ...g, counter: g.counter + 1, memo: m, memoNames: ms }, fnName: n };
+}
+
+function addDecl(g: Gen, d: MDecl): Gen {
+  let ds = g.decls;
+  ds.push(d);
+  return Gen { ...g, decls: ds };
+}
+
+function needType(g: Gen, ctx: Ctx, typeName: string, source: string): Gen {
+  if (source == ctx.modulePath) {
+    return g;
+  }
+  let im = g.imports;
+  im.push(importFrom([typeName], source));
+  return Gen { ...g, imports: im };
+}
+
+function isPrim(n: string): bool {
+  return n == "string" || n == "int" || n == "bool";
+}
+
+function unsupported(g: Gen, ctx: Ctx, t: MType): Got {
+  return Got {
+    gen: withProblem(
+      g,
+      ctx,
+      "type " + typeKey(t)
+          + " cannot be written as or read from JSON (supported: string, int, bool, JsonValue, arrays, Option, records and tag unions of those)",
+    ),
+    fnName: "",
+  };
+}
+
+// ---- encoders -----------------------------------------------------------------------------------------------------------
+
+// encoderFor(g, ctx, t) -- the name of a function `(T) => JsonValue`.
+export function encoderFor(g0: Gen, ctx: Ctx, t: MType): Got {
+  const known = memoIndex(g0, "e:" + typeKey(t));
+  if (known >= 0) {
+    return Got { gen: g0, fnName: g0.memoNames[known.toUsize()] };
+  }
+  return match (t) {
+    MNamed(n, args) => encodeNamed(g0, ctx, t, n, args),
+    MArray(e) => encodeWrapper(g0, ctx, t, e, "encArray"),
+    MOption(e) => encodeWrapper(g0, ctx, t, e, "encOption"),
+    _ => unsupported(g0, ctx, t),
+  };
+}
+
+function encodeWrapper(g0: Gen, ctx: Ctx, t: MType, elem: MType, helper: string): Got {
+  const r = reserve(g0, "e:" + typeKey(t), "enc");
+  const inner = encoderFor(r.gen, ctx, elem);
+  if (inner.fnName == "") {
+    return Got { gen: inner.gen, fnName: "" };
+  }
+  let g = useWeb(inner.gen, helper);
+  g = useJson(g);
+  const body = [ret(call(helper, [name("v"), name(inner.fnName)]))];
+  g = addDecl(g, fn(r.fnName, [param("v", t)], named("JsonValue"), body));
+  return Got { gen: g, fnName: r.fnName };
+}
+
+function encodeNamed(g0: Gen, ctx: Ctx, t: MType, n: string, args: MType[]): Got {
+  if (args.length == 0 && isPrim(n)) {
+    const f = n == "string" ? "jsonString" : n == "int" ? "jsonInt" : "jsonBool";
+    return Got { gen: useWeb(g0, f), fnName: f };
+  }
+  if (args.length == 0 && n == "JsonValue") {
+    return Got { gen: useWeb(g0, "jsonPassthrough"), fnName: "jsonPassthrough" };
+  }
+  const shape = findShape(ctx.types, n);
+  if (shape.isNone() || args.length > 0 || shape.unwrap().typeParams.length > 0) {
+    return unsupported(g0, ctx, t);
+  }
+  const s = shape.unwrap();
+  return match (s.shape) {
+    MSAlias(target) => encoderFor(g0, ctx, target),
+    MSRecord(fields) => encodeRecord(g0, ctx, t, s, fields),
+    MSUnion(variants) => encodeTags(g0, ctx, t, s, variants),
+    MSOpaque => unsupported(g0, ctx, t),
+  };
+}
+
+function encodeRecord(g0: Gen, ctx: Ctx, t: MType, s: MTypeShape, fields: MFieldView[]): Got {
+  const r = reserve(g0, "e:" + typeKey(t), "enc");
+  let g = needType(r.gen, ctx, s.name, s.source);
+  g = useJson(g);
+  g = useWeb(g, "jsonObject");
+  g = useWeb(g, "jsonMember");
+  let members: MExpr[] = [];
+  for (const f of fields) {
+    const e = encoderFor(g, ctx, f.ty);
+    g = e.gen;
+    if (e.fnName == "") {
+      return Got { gen: g, fnName: "" };
+    }
+    members.push(
+      call("jsonMember", [str(f.name), callExpr(name(e.fnName), [dot(name("v"), f.name)])]),
+    );
+  }
+  const body = [ret(call("jsonObject", [arrayLit(members)]))];
+  g = addDecl(g, fn(r.fnName, [param("v", t)], named("JsonValue"), body));
+  return Got { gen: g, fnName: r.fnName };
+}
+
+function encodeTags(g0: Gen, ctx: Ctx, t: MType, s: MTypeShape, variants: MVariant[]): Got {
+  for (const v of variants) {
+    if (v.payload.length > 0) {
+      return unsupported(g0, ctx, t);
+    }
+  }
+  const r = reserve(g0, "e:" + typeKey(t), "enc");
+  let g = needType(r.gen, ctx, s.name, s.source);
+  g = useJson(g);
+  g = useWeb(g, "jsonString");
+  let arms = variants.map(v => arm(pVariant(v.name, []), str(v.name)));
+  const body = [ret(call("jsonString", [matchExpr(name("v"), arms)]))];
+  g = addDecl(g, fn(r.fnName, [param("v", t)], named("JsonValue"), body));
+  return Got { gen: g, fnName: r.fnName };
+}
+
+// ---- decoders -----------------------------------------------------------------------------------------------------------
+
+function decodeResult(t: MType): MType {
+  return resultOf(t, named("DecodeError"));
+}
+
+// decoderFor(g, ctx, t) -- the name of a function `(DecodeCursor) => Result<T, DecodeError>`.
+export function decoderFor(g0: Gen, ctx: Ctx, t: MType): Got {
+  const known = memoIndex(g0, "d:" + typeKey(t));
+  if (known >= 0) {
+    return Got { gen: g0, fnName: g0.memoNames[known.toUsize()] };
+  }
+  return match (t) {
+    MNamed(n, args) => decodeNamed(g0, ctx, t, n, args),
+    MArray(e) => decodeArrayOf(g0, ctx, t, e),
+    _ => unsupported(g0, ctx, t),
+  };
+}
+
+function decodeArrayOf(g0: Gen, ctx: Ctx, t: MType, elem: MType): Got {
+  const r = reserve(g0, "d:" + typeKey(t), "dec");
+  const inner = decoderFor(r.gen, ctx, elem);
+  if (inner.fnName == "") {
+    return Got { gen: inner.gen, fnName: "" };
+  }
+  let g = useWeb(inner.gen, "decArr");
+  g = useDecode(g, ["DecodeCursor", "DecodeError"]);
+  const body = [ret(call("decArr", [name("c"), name(inner.fnName)]))];
+  g = addDecl(g, fn(r.fnName, [param("c", named("DecodeCursor"))], decodeResult(t), body));
+  return Got { gen: g, fnName: r.fnName };
+}
+
+function decodeNamed(g0: Gen, ctx: Ctx, t: MType, n: string, args: MType[]): Got {
+  if (args.length == 0 && isPrim(n)) {
+    const f = n == "string" ? "decStr" : n == "int" ? "decInt" : "decBool";
+    return Got { gen: useWeb(g0, f), fnName: f };
+  }
+  const shape = findShape(ctx.types, n);
+  if (shape.isNone() || args.length > 0 || shape.unwrap().typeParams.length > 0) {
+    return unsupported(g0, ctx, t);
+  }
+  const s = shape.unwrap();
+  return match (s.shape) {
+    MSAlias(target) => decoderFor(g0, ctx, target),
+    MSRecord(fields) => decodeRecord(g0, ctx, t, s, fields),
+    MSUnion(variants) => decodeTags(g0, ctx, t, s, variants),
+    MSOpaque => unsupported(g0, ctx, t),
+  };
+}
+
+function decodeRecord(g0: Gen, ctx: Ctx, t: MType, s: MTypeShape, fields: MFieldView[]): Got {
+  const r = reserve(g0, "d:" + typeKey(t), "dec");
+  let g = needType(r.gen, ctx, s.name, s.source);
+  g = useDecode(g, ["DecodeCursor", "DecodeError", "checkFields", "RejectUnknown"]);
+  g = useWeb(g, "decField");
+  let known: MExpr[] = [];
+  for (const f of fields) {
+    known.push(str(f.name));
+  }
+  let body: MStmt[] = [
+    exprS(tryOp(call("checkFields", [name("c"), arrayLit(known), name("RejectUnknown")]))),
+  ];
+  let inits: MFieldInit[] = [];
+  for (const f of fields) {
+    const local = fresh("f_" + f.name, g.base + g.counter);
+    g = Gen { ...g, counter: g.counter + 1 };
+    const optional = match (f.ty) {
+      MOption(inner) => Some(inner),
+      _ => None,
+    };
+    if (optional.isSome()) {
+      const d = decoderFor(g, ctx, optional.unwrap());
+      g = useWeb(d.gen, "decFieldOpt");
+      if (d.fnName == "") {
+        return Got { gen: g, fnName: "" };
+      }
+      body.push(
+        constS(local, tryOp(call("decFieldOpt", [name("c"), str(f.name), name(d.fnName)]))),
+      );
+    } else {
+      const d = decoderFor(g, ctx, f.ty);
+      g = d.gen;
+      if (d.fnName == "") {
+        return Got { gen: g, fnName: "" };
+      }
+      body.push(constS(local, tryOp(call("decField", [name("c"), str(f.name), name(d.fnName)]))));
+    }
+    inits.push(initField(f.name, name(local)));
+  }
+  body.push(ret(call("Ok", [record(s.name, inits)])));
+  g = addDecl(g, fn(r.fnName, [param("c", named("DecodeCursor"))], decodeResult(t), body));
+  return Got { gen: g, fnName: r.fnName };
+}
+
+function decodeTags(g0: Gen, ctx: Ctx, t: MType, s: MTypeShape, variants: MVariant[]): Got {
+  for (const v of variants) {
+    if (v.payload.length > 0) {
+      return unsupported(g0, ctx, t);
+    }
+  }
+  const r = reserve(g0, "d:" + typeKey(t), "dec");
+  let g = needType(r.gen, ctx, s.name, s.source);
+  g = useDecode(g, ["DecodeCursor", "DecodeError"]);
+  g = useWeb(g, "decEnum");
+  let names: MExpr[] = [];
+  let values: MExpr[] = [];
+  for (const v of variants) {
+    names.push(str(v.name));
+    values.push(name(v.name));
+  }
+  const body = [ret(call("decEnum", [name("c"), arrayLit(names), arrayLit(values)]))];
+  g = addDecl(g, fn(r.fnName, [param("c", named("DecodeCursor"))], decodeResult(t), body));
+  return Got { gen: g, fnName: r.fnName };
+}
+
+// ---- imports ------------------------------------------------------------------------------------------------------------
+
+// The imports the generated helpers need (and the record types of other modules).
+export function importsOf(g: Gen, webModule: string): MImport[] {
+  let out: MImport[] = [];
+  if (g.web.length > 0) {
+    out.push(importFrom(uniqueSorted(g.web), webModule));
+  }
+  if (g.decode.length > 0) {
+    out.push(importFrom(uniqueSorted(g.decode), "std:json/decode"));
+  }
+  if (g.json.length > 0) {
+    out.push(importFrom(uniqueSorted(g.json), "std:json"));
+  }
+  for (const i of g.imports) {
+    out.push(i);
+  }
+  return out;
+}

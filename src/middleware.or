@@ -1,0 +1,201 @@
+// Ready-made middleware. A `Middleware` is `(req, next) => Result<Response, WebError>`; see router.or for how they compose.
+//
+// Errors pass through a middleware as `Err(WebError)`. A middleware that must also change the response of a failing request
+// (CORS, logging) therefore handles both arms: it adds its fields to a response, and to `WebError.headers` of an error, which
+// the error handler copies into the rendered response.
+import { Headers } from "std:http";
+import { Request } from "./request";
+import { Response } from "./response";
+import {
+  WebError, unauthorized, webError, withErrorHeader, webErrorStatus, PayloadTooLarge,
+} from "./error";
+import { Handler, Middleware, ErrorHandler } from "./router";
+
+// ------------------------------------------------------------------------------------------------ logging
+
+// logger(sink): Middleware -- calls `sink` once per request, after it was answered, with "METHOD path -> status". An error
+// is logged with the status it will be rendered with. The sink decides where the line goes:
+//   app.use(logger((line: string) => console.error(line)));
+export function logger(sink: (line: string) => void): Middleware {
+  return (req: Request, next: Handler): Result<Response, WebError> => {
+    const r = next(req);
+    const code = r.isOk() ? r.unwrap().status() : webErrorStatus(r.unwrapErr());
+    sink(req.methodText() + " " + req.path() + " -> " + code.toString());
+    return r;
+  };
+}
+
+// ------------------------------------------------------------------------------------------------ recovery
+
+// recover(render): Middleware -- turns an error from the inner handlers into the response `render` makes. Put it inside
+// middleware that wants to see a response (for example behind `cors`).
+//
+// A trap (an out-of-range index, `unwrap` of `None`, a failed assertion) is not an error value: Orin cannot catch it, it ends
+// the process. `recover` handles the failures a handler returns, so handlers should return `Err` for every failure
+// that is not a bug.
+export function recover(render: ErrorHandler): Middleware {
+  return (req: Request, next: Handler): Result<Response, WebError> => {
+    const r = next(req);
+    if (r.isOk()) {
+      return r;
+    }
+    return Ok(render(req, r.unwrapErr()));
+  };
+}
+
+// ------------------------------------------------------------------------------------------------ authentication
+
+// A best-effort constant-time comparison: it looks at every byte of the longer string, so the time does not depend on where the
+// first difference is.
+export function constantTimeEquals(a: string, b: string): bool {
+  const n = a.length > b.length ? a.length : b.length;
+  let diff: int = a.length != b.length ? 1 : 0;
+  let i: usize = 0;
+  while (i < n) {
+    const x = i < a.length ? a.charCodeAt(i) : 0;
+    const y = i < b.length ? b.charCodeAt(i) : 0;
+    if (x != y) {
+      diff += 1;
+    }
+    i += 1;
+  }
+  return diff == 0;
+}
+
+// bearerAuth(verify): Middleware -- requires `Authorization: Bearer <token>`. `verify(token)` answers the principal (a user name or
+// id) of a valid token, or None. The principal is attached to the request as the attribute "principal"
+// (`req.attr("principal")`). A missing or malformed field is 401 with `WWW-Authenticate: Bearer`; a rejected token is 401 with
+// `error="invalid_token"` (RFC 6750).
+//
+// To protect only some routes, `mount` them in a group with this middleware, or wrap one handler with `withMiddleware`.
+export function bearerAuth(verify: (token: string) => Option<string>): Middleware {
+  return (req: Request, next: Handler): Result<Response, WebError> => {
+    const token = req.bearerToken();
+    if (token.isNone()) {
+      return Err(
+        withErrorHeader(unauthorized("missing bearer token"), "WWW-Authenticate", "Bearer"),
+      );
+    }
+    const who = verify(token.unwrap());
+    if (who.isNone()) {
+      return Err(
+        withErrorHeader(
+          unauthorized("invalid bearer token"),
+          "WWW-Authenticate",
+          "Bearer error=\"invalid_token\"",
+        ),
+      );
+    }
+    return next(req.withAttr("principal", who.unwrap()));
+  };
+}
+
+// bearerToken(expected, principal): Middleware -- `bearerAuth` for one shared secret, compared in constant time; the principal
+// attribute is the given name.
+export function bearerToken(expected: string, principal: string): Middleware {
+  return bearerAuth(
+    (token: string): Option<string> => constantTimeEquals(token, expected) ? Some(principal) : None,
+  );
+}
+
+// ------------------------------------------------------------------------------------------------ body limit
+
+// limitBody(maxBytes): Middleware -- 413 when the request body is longer than `maxBytes`. (The server already enforces the limit
+// of its `ServerConfig.maxBody` while reading; this is for a tighter limit on some routes.)
+export function limitBody(maxBytes: usize): Middleware {
+  return (req: Request, next: Handler): Result<Response, WebError> => {
+    if (req.body().length() > maxBytes) {
+      return Err(
+        webError(PayloadTooLarge, "body is larger than " + maxBytes.toString() + " bytes"),
+      );
+    }
+    return next(req);
+  };
+}
+
+// ------------------------------------------------------------------------------------------------ CORS
+
+// origins: the allowed `Origin` values; "*" allows any (a browser then gets "*", or the origin itself when credentials are
+// allowed, because "*" is not valid with credentials). methods / headers: answered to a preflight; when `headers` is empty
+// the headers the browser asks for are allowed. exposed: `Access-Control-Expose-Headers`. maxAge: seconds a preflight may be
+// cached (0 = not sent).
+export type CorsConfig = {
+  origins: string[];
+  methods: string[];
+  headers: string[];
+  exposed: string[];
+  credentials: bool;
+  maxAge: int;
+};
+
+// defaultCors(): CorsConfig -- any origin, the usual methods, any requested header, no credentials, a preflight cached for ten
+// minutes. Replace fields: `CorsConfig { ...defaultCors(), origins: ["https://app.example"] }`.
+export function defaultCors(): CorsConfig {
+  return CorsConfig {
+    origins: ["*"],
+    methods: ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"],
+    headers: [],
+    exposed: [],
+    credentials: false,
+    maxAge: 600,
+  };
+}
+
+function originAllowed(c: CorsConfig, origin: string): bool {
+  return c.origins.includes("*") || c.origins.includes(origin);
+}
+
+// The Access-Control-Allow-Origin value for an allowed origin.
+function allowOriginValue(c: CorsConfig, origin: string): string {
+  return c.origins.includes("*") && !c.credentials ? "*" : origin;
+}
+
+function addCors(c: CorsConfig, origin: string, h: Headers): Headers {
+  let out = h;
+  out.set("Access-Control-Allow-Origin", allowOriginValue(c, origin)).unwrap();
+  if (!(c.origins.includes("*") && !c.credentials)) {
+    out.add("Vary", "Origin").unwrap();
+  }
+  if (c.credentials) {
+    out.set("Access-Control-Allow-Credentials", "true").unwrap();
+  }
+  if (c.exposed.length > 0) {
+    out.set("Access-Control-Expose-Headers", c.exposed.join(", ")).unwrap();
+  }
+  return out;
+}
+
+// cors(config): Middleware -- Cross-Origin Resource Sharing. A request without `Origin`, or from an origin that is not allowed,
+// passes unchanged (the browser enforces the refusal). A preflight (OPTIONS with `Access-Control-Request-Method`) from an allowed
+// origin is answered 204 without reaching the router. Other requests get the `Access-Control-*` fields on the response or the
+// error. Put it first, so that every answer carries them.
+export function cors(config: CorsConfig): Middleware {
+  return (req: Request, next: Handler): Result<Response, WebError> => {
+    const origin = req.header("origin");
+    if (origin.isNone() || !originAllowed(config, origin.unwrap())) {
+      return next(req);
+    }
+    const o = origin.unwrap();
+    if (req.methodText() == "OPTIONS" && req.header("access-control-request-method").isSome()) {
+      let h = addCors(config, o, Response.empty(204).headers());
+      h.set("Access-Control-Allow-Methods", config.methods.join(", ")).unwrap();
+      const asked = req.header("access-control-request-headers");
+      if (config.headers.length > 0) {
+        h.set("Access-Control-Allow-Headers", config.headers.join(", ")).unwrap();
+      } else if (asked.isSome()) {
+        h.set("Access-Control-Allow-Headers", asked.unwrap()).unwrap();
+      }
+      if (config.maxAge > 0) {
+        h.set("Access-Control-Max-Age", config.maxAge.toString()).unwrap();
+      }
+      return Ok(Response.empty(204).withHeaders(h));
+    }
+    const r = next(req);
+    if (r.isOk()) {
+      const res = r.unwrap();
+      return Ok(res.withHeaders(addCors(config, o, res.headers())));
+    }
+    const e = r.unwrapErr();
+    return Err(WebError { kind: e.kind, detail: e.detail, headers: addCors(config, o, e.headers) });
+  };
+}

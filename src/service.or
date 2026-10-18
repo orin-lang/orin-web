@@ -1,0 +1,300 @@
+// `@Service`: a class that the generated container creates and injects.
+//
+//   @Service export class TodoService {
+//     constructor(private repo: TodoRepository) {}
+//     static create(repo: TodoRepository): TodoService { return new TodoService(repo); }
+//   }
+//
+// The dependencies of a service are the parameters of its static `create` factory. (They should be the parameters of the constructor:
+// generated code cannot write `new TodoService(..)`, because std:meta has no such expression, so the factory is the one line of
+// ceremony per class; see docs/compiler-issues.md.) A dependency is resolved by TYPE among the services of the same module: a
+// service is known under its class name, or under the interface it is registered as, `@Service("TodoRepository")`. A dependency
+// that no service of the module provides becomes a field of `ServicesDeps`, named like the parameter: the application passes it in
+// (a channel to an owner task, a configuration value, a service of another module).
+//
+// For the module the processor generates, in its companion module:
+//
+//   export type Services = { <one field per service, lowerCamelCase of its type name> };
+//   export type ServicesDeps = { <one field per unresolved dependency> };
+//   export function buildServices(deps: ServicesDeps): Services     // creates the services in dependency order
+//
+// and it reports, at the class, a missing `create`, two services for one type, a dependency that is declared in the module but is not
+// a service, and dependency cycles (with the cycle spelled out).
+import {
+  Input, Output, MDecl, MStmt, MExpr, MParam, MDiagnostic, MFieldInit, MRef, fresh, named, fn,
+  param, recordType, constS, constT, ret, name, dot, method, record, initField, exportDecl, output,
+  withDiagnostics, diagError,
+} from "std:meta";
+import {
+  annotationString, findMethod, plainName, lowerCamel, isLocalOpaque, typeKey,
+} from "./metautil";
+
+@Annotation(class)
+export type Service = { as: Option<string>; };
+
+// A service of the module, resolved: the type it is injected as (`key`), the field it gets in `Services`, the parameters of its
+// factory and the beans (indices) it depends on.
+export type Bean = {
+  cls: string;
+  key: string;
+  field: string;
+  ref: MRef;
+  deps: MParam[];
+  edges: int[];
+};
+
+// beans: the services in declaration order; order: indices of `beans` with every service after its dependencies; external: the
+// dependencies nobody in the module provides; problems: the diagnostics.
+export type Resolution = {
+  beans: Bean[];
+  order: int[];
+  external: MParam[];
+  problems: MDiagnostic[];
+};
+
+function indexOfKey(beans: Bean[], key: string): int {
+  let i: usize = 0;
+  while (i < beans.length) {
+    if (beans[i].key == key) {
+      return i.toInt();
+    }
+    i += 1;
+  }
+  return -1;
+}
+
+// The spelled-out cycle that starts at `start` among the unplaced beans: follow the first unplaced edge until a bean repeats.
+function cycleFrom(beans: Bean[], placed: bool[], start: int): string {
+  let path: int[] = [start];
+  let cur = start;
+  let going = true;
+  while (going) {
+    let next = -1;
+    for (const e of beans[cur.toUsize()].edges) {
+      if (!placed[e.toUsize()] && next < 0) {
+        next = e;
+      }
+    }
+    if (next < 0) {
+      going = false;
+    } else {
+      let seen = -1;
+      let k: usize = 0;
+      while (k < path.length) {
+        if (path[k] == next) {
+          seen = k.toInt();
+        }
+        k += 1;
+      }
+      if (seen >= 0) {
+        let names: string[] = [];
+        let j = seen.toUsize();
+        while (j < path.length) {
+          names.push(beans[path[j].toUsize()].cls);
+          j += 1;
+        }
+        names.push(beans[next.toUsize()].cls);
+        return names.join(" -> ");
+      }
+      path.push(next);
+      cur = next;
+    }
+  }
+  return beans[start.toUsize()].cls;
+}
+
+// resolveServices(input) -- reads the services of the module, checks the graph and orders it so that a service comes after its dependencies.
+// Pure; the processor and its tests call it.
+export function resolveServices(input: Input): Resolution {
+  let beans: Bean[] = [];
+  let problems: MDiagnostic[] = [];
+  let external: MParam[] = [];
+  for (const d of input.decls) {
+    const asKey = annotationString(d.annotations, "Service", "as");
+    const key = asKey.isSome() ? asKey.unwrap() : d.name;
+    const factory = findMethod(d, "create");
+    if (factory.isNone()) {
+      problems.push(
+        diagError(
+          d.ref,
+          "@Service class " + d.name
+              + " needs a static factory `create(..)` whose parameters are its dependencies; generated code cannot call `new "
+              + d.name + "(..)`",
+        ),
+      );
+    } else if (indexOfKey(beans, key) >= 0) {
+      problems.push(
+        diagError(
+          d.ref,
+          "two services provide " + key + ": " + beans[indexOfKey(beans, key).toUsize()].cls
+              + " and " + d.name,
+        ),
+      );
+    } else {
+      if (plainName(factory.unwrap().returns) != d.name) {
+        problems.push(
+          diagError(
+            d.ref,
+            d.name + ".create must return " + d.name + ", not " + typeKey(factory.unwrap().returns),
+          ),
+        );
+      }
+      beans.push(Bean {
+        cls: d.name,
+        key: key,
+        field: lowerCamel(key),
+        ref: d.ref,
+        deps: factory.unwrap().params,
+        edges: [],
+      });
+    }
+  }
+  // edges, and the dependencies that nobody in the module provides
+  let b: usize = 0;
+  while (b < beans.length) {
+    let edges: int[] = [];
+    for (const p of beans[b].deps) {
+      const k = plainName(p.ty);
+      const target = k.length > 0 ? indexOfKey(beans, k) : -1;
+      if (target >= 0) {
+        edges.push(target);
+      } else if (k.length > 0 && isLocalOpaque(input.types, input.modulePath, k)) {
+        problems.push(
+          diagError(
+            beans[b].ref,
+            beans[b].cls + " depends on " + k
+                + ", which is declared in this module but no @Service provides it (annotate its implementation; for an interface write @Service(\""
+                + k + "\"))",
+          ),
+        );
+      } else {
+        let known = false;
+        for (const e of external) {
+          if (e.name == p.name) {
+            known = true;
+            if (typeKey(e.ty) != typeKey(p.ty)) {
+              problems.push(
+                diagError(
+                  beans[b].ref,
+                  "the dependency `" + p.name + "` of " + beans[b].cls + " has type "
+                      + typeKey(p.ty) + ", but another service declares `" + p.name + "` as "
+                      + typeKey(e.ty),
+                ),
+              );
+            }
+          }
+        }
+        if (!known) {
+          external.push(p);
+        }
+      }
+    }
+    beans[b] = Bean {
+      cls: beans[b].cls,
+      key: beans[b].key,
+      field: beans[b].field,
+      ref: beans[b].ref,
+      deps: beans[b].deps,
+      edges: edges,
+    };
+    b += 1;
+  }
+  // order: repeatedly place the beans whose dependencies are placed
+  let placed: bool[] = [];
+  for (const x of beans) {
+    placed.push(false);
+  }
+  let order: int[] = [];
+  let progress = true;
+  while (progress && order.length < beans.length) {
+    progress = false;
+    let k: usize = 0;
+    while (k < beans.length) {
+      if (!placed[k]) {
+        let ready = true;
+        for (const e of beans[k].edges) {
+          if (!placed[e.toUsize()]) {
+            ready = false;
+          }
+        }
+        if (ready) {
+          placed[k] = true;
+          order.push(k.toInt());
+          progress = true;
+        }
+      }
+      k += 1;
+    }
+  }
+  if (order.length < beans.length) {
+    let first = -1;
+    let k: usize = 0;
+    while (k < beans.length) {
+      if (!placed[k] && first < 0) {
+        first = k.toInt();
+      }
+      k += 1;
+    }
+    problems.push(
+      diagError(
+        beans[first.toUsize()].ref,
+        "dependency cycle among services: " + cycleFrom(beans, placed, first),
+      ),
+    );
+  }
+  return Resolution { beans: beans, order: order, external: external, problems: problems };
+}
+
+function varName(g: int, b: Bean): string {
+  return fresh(b.field, g);
+}
+
+// The generated declarations for a resolved module (nothing when there are problems: the diagnostics are the output).
+function generate(r: Resolution, base: int): MDecl[] {
+  let fields: MParam[] = [];
+  let body: MStmt[] = [];
+  let inits: MFieldInit[] = [];
+  for (const idx of r.order) {
+    const b = r.beans[idx.toUsize()];
+    let args: MExpr[] = [];
+    for (const p of b.deps) {
+      const k = plainName(p.ty);
+      const target = k.length > 0 ? indexOfKey(r.beans, k) : -1;
+      if (target >= 0) {
+        args.push(name(varName(base, r.beans[target.toUsize()])));
+      } else {
+        args.push(dot(name("deps"), p.name));
+      }
+    }
+    const made = method(name(b.cls), "create", args);
+    body.push(
+      b.key == b.cls
+          ? constS(varName(base, b), made)
+          : constT(varName(base, b), named(b.key), made),
+    );
+  }
+  for (const b of r.beans) {
+    fields.push(param(b.field, named(b.key)));
+    inits.push(initField(b.field, name(varName(base, b))));
+  }
+  body.push(ret(record("Services", inits)));
+  let decls: MDecl[] = [];
+  decls.push(exportDecl(recordType("Services", fields), true));
+  decls.push(exportDecl(recordType("ServicesDeps", r.external), true));
+  decls.push(
+    exportDecl(
+      fn("buildServices", [param("deps", named("ServicesDeps"))], named("Services"), body),
+      true,
+    ),
+  );
+  return decls;
+}
+
+@Processor(Service)
+export function serviceProc(input: Input): Output {
+  const r = resolveServices(input);
+  if (r.problems.length > 0) {
+    return withDiagnostics(output([]), r.problems);
+  }
+  return output(generate(r, input.freshBase));
+}

@@ -1,0 +1,430 @@
+// Routing: patterns with path parameters, method matching, route groups (`mount`), middleware, and the error and
+// not-found handlers. A `Router` is a plain value that is built once with mutating methods and then only read:
+//
+//   let api = new Router();
+//   api.get("/users/:id", getUser);
+//   let app = new Router();
+//   app.use(logger(console.error));
+//   app.mount("/api/v1", api);
+//   const response = app.handle(request);        // always a Response: errors are rendered
+//
+// Patterns. A pattern is a path of segments separated by "/". A segment is a literal ("users"), a parameter (":id"), which
+// matches exactly one non-empty segment and captures it (decoded) under that name, or, as the last segment, a wildcard
+// ("*rest"), which matches the remaining segments (possibly none) and captures them joined by "/". Empty segments are ignored on
+// both sides, so "/users/" and "/users" are the same path. Matching is by segment, never by prefix of text.
+//
+// When several routes match a path, the most specific wins: comparing segment by segment from the left, a literal beats a
+// parameter, a parameter beats the end of the path ("/files/:name" beats "/files/*rest"), and the earlier registration beats a
+// later one of the same shape. A path that matches only routes of other methods is answered 405 with an `Allow` field;
+// `HEAD` falls back to a `GET` route and `OPTIONS` to an automatic 204 with `Allow`.
+import { exit } from "std:process";
+import { Method, Get, Headers, emptyHeaders } from "std:http";
+import { empty } from "std:bytes";
+import { QueryPair } from "std:url";
+import {
+  WebError, WebErrorKind, NotFound, MethodNotAllowed, webError, withErrorHeader, webErrorStatus,
+  webErrorMessage,
+} from "./error";
+import { Request, RequestParts } from "./request";
+import { Response } from "./response";
+import { jsonObject, jsonMember, jsonString, jsonInt } from "./jsonbuild";
+
+export type Handler = (req: Request) => Result<Response, WebError>;
+// A middleware gets the request and the rest of the chain. It may answer without calling `next`, change the request it
+// passes on, and change the response or error that comes back.
+export type Middleware = (req: Request, next: Handler) => Result<Response, WebError>;
+export type ErrorHandler = (req: Request, err: WebError) => Response;
+
+type Seg = Lit(string) | Param(string) | Rest(string);
+
+type Route = { method: string; pattern: string; segs: Seg[]; handler: Handler; };
+
+// A programming error in the route table (a bad pattern) is not a failure of a request: it traps at start-up, naming the pattern.
+function trap(message: string): void {
+  console.error("trap: orin-web: " + message);
+  exit(101);
+}
+
+function segText(s: Seg): string {
+  return match (s) {
+    Lit(t) => t,
+    Param(n) => ":" + n,
+    Rest(n) => "*" + n,
+  };
+}
+
+// parsePattern(pattern): Result<Seg[], string> -- Err names the problem.
+function parsePattern(pattern: string): Result<Seg[], string> {
+  if (!pattern.startsWith("/")) {
+    return Err("pattern must start with '/': " + pattern);
+  }
+  let segs: Seg[] = [];
+  let names: string[] = [];
+  const parts = pattern.split("/").filter(p => p.length > 0);
+  let i: usize = 0;
+  while (i < parts.length) {
+    const p = parts[i];
+    if (p.startsWith(":") || p.startsWith("*")) {
+      const name = p.substring(1, p.length);
+      if (name.length == 0) {
+        return Err("a parameter needs a name: " + pattern);
+      }
+      if (names.includes(name)) {
+        return Err("duplicate parameter '" + name + "': " + pattern);
+      }
+      names.push(name);
+      if (p.startsWith("*")) {
+        if (i + 1 != parts.length) {
+          return Err("a wildcard must be the last segment: " + pattern);
+        }
+        segs.push(Rest(name));
+      } else {
+        segs.push(Param(name));
+      }
+    } else {
+      segs.push(Lit(p));
+    }
+    i += 1;
+  }
+  return Ok(segs);
+}
+
+// matchSegs(segs, path): Option<QueryPair[]> -- the captured parameters when the pattern matches the path.
+function matchSegs(segs: Seg[], path: string[]): Option<QueryPair[]> {
+  let params: QueryPair[] = [];
+  let i: usize = 0;
+  while (i < segs.length) {
+    const s = segs[i];
+    const isRest = match (s) {
+      Rest(n) => true,
+      _ => false,
+    };
+    if (isRest) {
+      let tail = "";
+      let j = i;
+      while (j < path.length) {
+        tail = j == i ? path[j] : tail + "/" + path[j];
+        j += 1;
+      }
+      params.push(QueryPair { key: restName(s), value: tail });
+      return Some(params);
+    }
+    if (i >= path.length) {
+      return None;
+    }
+    match (s) {
+      Lit(t) => {
+        if (t != path[i]) {
+          return None;
+        }
+      },
+      Param(n) => {
+        params.push(QueryPair { key: n, value: path[i] });
+      },
+      Rest(n) => {},
+    }
+    i += 1;
+  }
+  if (path.length != segs.length) {
+    return None;
+  }
+  return Some(params);
+}
+
+function restName(s: Seg): string {
+  return match (s) {
+    Rest(n) => n,
+    _ => "",
+  };
+}
+
+// Specificity of the segment at position i: literal 4, parameter 3, end of the pattern 2, wildcard 1.
+function rank(segs: Seg[], i: usize): int {
+  if (i >= segs.length) {
+    return 2;
+  }
+  return match (segs[i]) {
+    Lit(t) => 4,
+    Param(n) => 3,
+    Rest(n) => 1,
+  };
+}
+
+// moreSpecific(a, b): bool -- `a` is strictly more specific than `b` (both match the same path).
+function moreSpecific(a: Seg[], b: Seg[]): bool {
+  const n = a.length > b.length ? a.length : b.length;
+  let i: usize = 0;
+  while (i <= n) {
+    const ra = rank(a, i);
+    const rb = rank(b, i);
+    if (ra != rb) {
+      return ra > rb;
+    }
+    i += 1;
+  }
+  return false;
+}
+
+function wrapOne(m: Middleware, h: Handler): Handler {
+  return (req: Request): Result<Response, WebError> => m(req, h);
+}
+
+// withMiddleware(mw, handler): Handler -- `handler` run behind `mw`: the way to put a middleware on one route.
+export function withMiddleware(mw: Middleware, handler: Handler): Handler {
+  return wrapOne(mw, handler);
+}
+
+// chain(mws, handler): Handler -- `handler` behind all of `mws`; the first is the outermost (it sees the request first
+// and the response last).
+export function chain(mws: Middleware[], handler: Handler): Handler {
+  let cur = handler;
+  let i = mws.length;
+  while (i > 0) {
+    i -= 1;
+    cur = wrapOne(mws[i], cur);
+  }
+  return cur;
+}
+
+function joinPath(prefix: string, pattern: string): string {
+  const a = prefix.split("/").filter(p => p.length > 0);
+  const b = pattern.split("/").filter(p => p.length > 0);
+  return "/" + a.concat(b).join("/");
+}
+
+function allowHeader(methods: string[]): string {
+  return methods.join(", ");
+}
+
+function jsonErrorResponse(e: WebError): Response {
+  const body = jsonObject([
+    jsonMember("error", jsonString(webErrorMessage(e))),
+    jsonMember("status", jsonInt(webErrorStatus(e))),
+  ]);
+  const r = Response.json(webErrorStatus(e), body);
+  const base = r.isOk() ? r.unwrap() : Response.text(webErrorStatus(e), webErrorMessage(e));
+  return base.withHeaders(mergeHeaders(base.headers(), e.headers));
+}
+
+// The fields of `extra` set on `base` (a field of the same name replaces).
+function mergeHeaders(base: Headers, extra: Headers): Headers {
+  let h = base;
+  let i: usize = 0;
+  while (i < extra.size()) {
+    h.add(extra.nameAt(i), extra.valueAt(i));
+    i += 1;
+  }
+  return h;
+}
+
+// defaultErrorResponse(req, err): Response -- the error handler a router uses unless `onError` replaced it: the status of the
+// error and a JSON body {"error": text, "status": code}; the error's own header fields are copied in.
+export function defaultErrorResponse(req: Request, err: WebError): Response {
+  return jsonErrorResponse(err);
+}
+
+export class Router {
+  private routes: Route[];
+  private mws: Middleware[];
+  private missing: Option<Handler>;
+  private failing: Option<ErrorHandler>;
+
+  constructor() {
+    this.routes = [];
+    this.mws = [];
+    this.missing = None;
+    this.failing = None;
+  }
+
+  // route(method, pattern, handler) -- registers a handler for a method ("GET", "POST", .. in upper case) and a pattern.
+  // Traps at start-up when the pattern is malformed (see the header of this file). `get`, `post`, .. are the usual spellings.
+  route(method: string, pattern: string, handler: Handler): void {
+    const segs = parsePattern(pattern);
+    if (segs.isErr()) {
+      trap(segs.unwrapErr());
+    } else {
+      this.routes.push(Route {
+        method: method,
+        pattern: pattern,
+        segs: segs.unwrap(),
+        handler: handler,
+      });
+    }
+  }
+
+  get(pattern: string, handler: Handler): void {
+    this.route("GET", pattern, handler);
+  }
+
+  post(pattern: string, handler: Handler): void {
+    this.route("POST", pattern, handler);
+  }
+
+  put(pattern: string, handler: Handler): void {
+    this.route("PUT", pattern, handler);
+  }
+
+  patch(pattern: string, handler: Handler): void {
+    this.route("PATCH", pattern, handler);
+  }
+
+  delete(pattern: string, handler: Handler): void {
+    this.route("DELETE", pattern, handler);
+  }
+
+  head(pattern: string, handler: Handler): void {
+    this.route("HEAD", pattern, handler);
+  }
+
+  options(pattern: string, handler: Handler): void {
+    this.route("OPTIONS", pattern, handler);
+  }
+
+  // any(pattern, handler) -- the same handler for GET, POST, PUT, PATCH and DELETE.
+  any(pattern: string, handler: Handler): void {
+    this.route("GET", pattern, handler);
+    this.route("POST", pattern, handler);
+    this.route("PUT", pattern, handler);
+    this.route("PATCH", pattern, handler);
+    this.route("DELETE", pattern, handler);
+  }
+
+  // use(mw) -- adds a middleware around everything this router answers (routes, 404 and 405 included). Middleware run in
+  // the order they were added: the first one added is the outermost. On a router that is later `mount`ed, a middleware
+  // wraps that router's routes only.
+  use(mw: Middleware): void {
+    this.mws.push(mw);
+  }
+
+  // mount(prefix, sub) -- a route group: every route of `sub` is added under `prefix` (which may hold parameters:
+  // "/orgs/:org"), behind the middleware of `sub`. The not-found and error handlers of `sub` are not carried over.
+  mount(prefix: string, sub: Router): void {
+    const checked = parsePattern(prefix);
+    if (checked.isErr()) {
+      trap(checked.unwrapErr());
+      return;
+    }
+    for (const r of sub.routes) {
+      const full = joinPath(prefix, r.pattern);
+      const segs = parsePattern(full);
+      if (segs.isErr()) {
+        trap(segs.unwrapErr());
+      } else {
+        this.routes.push(Route {
+          method: r.method,
+          pattern: full,
+          segs: segs.unwrap(),
+          handler: chain(sub.mws, r.handler),
+        });
+      }
+    }
+  }
+
+  // onNotFound(handler) -- the handler for a path no route matches (instead of the 404 error).
+  onNotFound(handler: Handler): void {
+    this.missing = Some(handler);
+  }
+
+  // onError(handler) -- renders every `WebError` that leaves a handler or middleware (instead of `defaultErrorResponse`).
+  onError(handler: ErrorHandler): void {
+    this.failing = Some(handler);
+  }
+
+  // size(): usize -- number of routes.
+  size(): usize {
+    return this.routes.length;
+  }
+
+  // patterns(): string[] -- "GET /users/:id" for each route, in registration order (for startup logs and tests).
+  patterns(): string[] {
+    return this.routes.map(r => r.method + " " + r.pattern);
+  }
+
+  // dispatch(req): Result<Response, WebError> -- the routing step alone, without this router's middleware or error handler.
+  dispatch(req: Request): Result<Response, WebError> {
+    const path = req.segments();
+    const want = req.methodText();
+    let best: Option<Route> = None;
+    let bestParams: QueryPair[] = [];
+    let headFallback: Option<Route> = None;
+    let headParams: QueryPair[] = [];
+    let anyPath = false;
+    let allowed: string[] = [];
+    for (const r of this.routes) {
+      const m = matchSegs(r.segs, path);
+      if (m.isSome()) {
+        anyPath = true;
+        if (!allowed.includes(r.method)) {
+          allowed.push(r.method);
+        }
+        if (r.method == want) {
+          if (best.isNone() || moreSpecific(r.segs, best.unwrap().segs)) {
+            best = Some(r);
+            bestParams = m.unwrap();
+          }
+        } else if (want == "HEAD" && r.method == "GET") {
+          if (headFallback.isNone() || moreSpecific(r.segs, headFallback.unwrap().segs)) {
+            headFallback = Some(r);
+            headParams = m.unwrap();
+          }
+        }
+      }
+    }
+    if (best.isSome()) {
+      return best.unwrap().handler(req.withParams(bestParams));
+    }
+    if (headFallback.isSome()) {
+      return headFallback.unwrap().handler(req.withParams(headParams));
+    }
+    if (!anyPath) {
+      if (this.missing.isSome()) {
+        return this.missing.unwrap()(req);
+      }
+      return Err(webError(NotFound, ""));
+    }
+    if (allowed.includes("GET") && !allowed.includes("HEAD")) {
+      allowed.push("HEAD");
+    }
+    if (!allowed.includes("OPTIONS")) {
+      allowed.push("OPTIONS");
+    }
+    const allow = allowHeader(allowed);
+    if (want == "OPTIONS") {
+      return Ok(Response.empty(204).withHeader("Allow", allow));
+    }
+    return Err(withErrorHeader(webError(MethodNotAllowed, ""), "Allow", allow));
+  }
+
+  // handle(req): Response -- runs the middleware and the routing, and renders an error with the error handler. Never fails.
+  handle(req: Request): Response {
+    const self = this;
+    const routed: Handler = (r: Request): Result<Response, WebError> => self.dispatch(r);
+    const result = chain(this.mws, routed)(req);
+    if (result.isOk()) {
+      return result.unwrap();
+    }
+    const e = result.unwrapErr();
+    if (this.failing.isSome()) {
+      return this.failing.unwrap()(req, e);
+    }
+    return defaultErrorResponse(req, e);
+  }
+
+  // fail(err): Response -- renders an error with this router's error handler, for a failure that happens before a request
+  // exists (a malformed request-target). The handler is given a request for "/".
+  fail(err: WebError): Response {
+    const root = Request
+        .tryNew(RequestParts { method: Get, target: "/", headers: emptyHeaders(), body: empty() })
+        .unwrap();
+    if (this.failing.isSome()) {
+      return this.failing.unwrap()(root, err);
+    }
+    return defaultErrorResponse(root, err);
+  }
+
+  // handler(): Handler -- this router as a handler, for `mount`ing under a different kind of server or for a custom main loop.
+  handler(): Handler {
+    const self = this;
+    return (r: Request): Result<Response, WebError> => Ok(self.handle(r));
+  }
+}

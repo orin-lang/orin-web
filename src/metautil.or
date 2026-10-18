@@ -1,0 +1,174 @@
+// Helpers shared by the annotation processors (pure; they run at compile time inside the processor executables, so this module
+// imports only `std:meta`).
+import {
+  MType, MNamed, MArray, MOption, MResult, MFn, MUnion, MTypeShape, MSRecord, MSUnion, MSAlias,
+  MSOpaque, MAnnotation, MConst, MCString, MCInt, MCNone, MCSome, MDeclView, MMethodView, MImport,
+  importFrom, findAnnotation, annotationArg, constString, constInt, named,
+} from "std:meta";
+
+// The module that generated code imports the runtime from.
+export const WEB_MODULE: string = "orin-web";
+
+// typeKey(t) -- a canonical text for a type: "Todo", "Todo[]", "Option<int>", "Result<A,B>". Used to name and de-duplicate helpers.
+export function typeKey(t: MType): string {
+  return match (t) {
+    MNamed(n, args) => args.length == 0 ? n : n + "<" + args.map(a => typeKey(a)).join(",") + ">",
+    MArray(e) => typeKey(e) + "[]",
+    MOption(e) => "Option<" + typeKey(e) + ">",
+    MResult(a, b) => "Result<" + typeKey(a) + "," + typeKey(b) + ">",
+    MFn(ps, r) => "(" + ps.map(a => typeKey(a)).join(",") + ")=>" + typeKey(r),
+    MUnion(vs) => "union",
+  };
+}
+
+// plainName(t) -- the name of a non-generic named type, else "".
+export function plainName(t: MType): string {
+  return match (t) {
+    MNamed(n, args) => args.length == 0 ? n : "",
+    _ => "",
+  };
+}
+
+// lowerCamel("TodoService") is "todoService": the field a service is stored under.
+export function lowerCamel(s: string): string {
+  if (s.length == 0) {
+    return s;
+  }
+  const first = s.charCodeAt(0);
+  if (first >= 65 && first <= 90) {
+    return String.fromCharCode(first + 32) + s.substring(1, s.length);
+  }
+  return s;
+}
+
+// The identifier characters of a type key (for helper names): "Todo[]" -> "Todo_arr".
+export function identOf(key: string): string {
+  let out = "";
+  let i: usize = 0;
+  while (i < key.length) {
+    const c = key.charCodeAt(i);
+    const isAlnum = c >= 48 && c <= 57 || c >= 65 && c <= 90 || c >= 97 && c <= 122 || c == 95;
+    if (isAlnum) {
+      out += key.charAt(i);
+    } else if (c == 91) {
+      out += "_arr";
+    } else if (c == 60) {
+      out += "_of_";
+    } else if (c == 44) {
+      out += "_";
+    }
+    i += 1;
+  }
+  return out;
+}
+
+export function annotationString(
+  list: MAnnotation[],
+  annotation: string,
+  arg: string,
+): Option<string> {
+  const a = findAnnotation(list, annotation);
+  if (a.isNone()) {
+    return None;
+  }
+  const v = annotationArg(a.unwrap(), arg);
+  if (v.isNone()) {
+    return None;
+  }
+  return unwrapSome(v.unwrap());
+}
+
+// An `Option<string>` argument arrives as MCNone / MCSome(MCString) (or the bare string when the field is a `string`).
+function unwrapSome(c: MConst): Option<string> {
+  return match (c) {
+    MCString(s) => Some(s),
+    MCSome(inner) => constString(inner),
+    _ => None,
+  };
+}
+
+export function annotationInt(list: MAnnotation[], annotation: string, arg: string): Option<int> {
+  const a = findAnnotation(list, annotation);
+  if (a.isNone()) {
+    return None;
+  }
+  const v = annotationArg(a.unwrap(), arg);
+  if (v.isNone()) {
+    return None;
+  }
+  return match (v.unwrap()) {
+    MCInt(n) => Some(n),
+    MCSome(inner) => constInt(inner),
+    _ => None,
+  };
+}
+
+export function hasAnnotation(list: MAnnotation[], annotation: string): bool {
+  return findAnnotation(list, annotation).isSome();
+}
+
+// findMethod(d, name) -- the method called `name` of a class view.
+export function findMethod(d: MDeclView, methodName: string): Option<MMethodView> {
+  for (const m of d.methods) {
+    if (m.name == methodName) {
+      return Some(m);
+    }
+  }
+  return None;
+}
+
+// findShape(types, name) -- the shape of the named type, as listed in the input.
+export function findShape(types: MTypeShape[], typeName: string): Option<MTypeShape> {
+  for (const t of types) {
+    if (t.name == typeName) {
+      return Some(t);
+    }
+  }
+  return None;
+}
+
+// isLocalClassLike(types, modulePath, name) -- a class or interface declared in the module being processed (the input lists classes and
+// interfaces as opaque types).
+export function isLocalOpaque(types: MTypeShape[], modulePath: string, typeName: string): bool {
+  const s = findShape(types, typeName);
+  if (s.isNone()) {
+    return false;
+  }
+  const isOpaque = match (s.unwrap().shape) {
+    MSOpaque => true,
+    _ => false,
+  };
+  return isOpaque && s.unwrap().source == modulePath;
+}
+
+// splitList("a, b=c ,") is ["a", "b=c"]: the comma-separated lists of @Path/@Query/@Header/@Use.
+export function splitList(text: string): string[] {
+  return text.split(",").map(p => p.trim()).filter(p => p.length > 0);
+}
+
+// importsOf(names, source) -- one import per source, names sorted and de-duplicated.
+export function importOf(names: string[], source: string): MImport {
+  return importFrom(uniqueSorted(names), source);
+}
+
+export function uniqueSorted(xs: string[]): string[] {
+  let out: string[] = [];
+  for (const x of xs) {
+    if (!out.includes(x)) {
+      out.push(x);
+    }
+  }
+  return out.sort((a: string, b: string): int => a < b ? -1 : a > b ? 1 : 0);
+}
+
+// upper("Get") is "GET" (ASCII).
+export function upper(s: string): string {
+  let out = "";
+  let i: usize = 0;
+  while (i < s.length) {
+    const c = s.charCodeAt(i);
+    out += c >= 97 && c <= 122 ? String.fromCharCode(c - 32) : s.charAt(i);
+    i += 1;
+  }
+  return out;
+}

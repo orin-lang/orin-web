@@ -1,0 +1,147 @@
+// Parameter binding: what the code generated for `@Controller` methods calls to read a path parameter, a query field or a header
+// field as a typed value. They are ordinary functions, so they can be used and tested by hand.
+//
+// Failures are the client's: a missing or malformed value is a 400 `WebError` that names the parameter and what was expected
+// (never the value that was sent). The `Opt` forms answer `None` for an absent value and still refuse a malformed one.
+import { eqIgnoreCase } from "std:http";
+import { WebError, badRequest } from "./error";
+import { Request } from "./request";
+
+function missing(kind: string, name: string): WebError {
+  return badRequest("missing " + kind + " '" + name + "'");
+}
+
+function malformed(kind: string, name: string, expected: string): WebError {
+  return badRequest(kind + " '" + name + "' must be " + expected);
+}
+
+function toInt(kind: string, name: string, text: string): Result<int, WebError> {
+  const n = parseInt(text);
+  if (n.isNone()) {
+    return Err(malformed(kind, name, "a whole number"));
+  }
+  return Ok(n.unwrap());
+}
+
+function toBool(kind: string, name: string, text: string): Result<bool, WebError> {
+  if (eqIgnoreCase(text, "true") || text == "1") {
+    return Ok(true);
+  }
+  if (eqIgnoreCase(text, "false") || text == "0") {
+    return Ok(false);
+  }
+  return Err(malformed(kind, name, "true or false"));
+}
+
+// ---- path parameters (a route pattern captures them: "/todos/:id") -------------------------------------------------------
+
+// bindPathString(req, name): Result<string, WebError> -- the captured segment, decoded. 400 when the route captured no `name`.
+export function bindPathString(req: Request, name: string): Result<string, WebError> {
+  const v = req.param(name);
+  if (v.isNone()) {
+    return Err(missing("path parameter", name));
+  }
+  return Ok(v.unwrap());
+}
+
+// bindPathInt(req, name): Result<int, WebError> -- 400 when absent or not a decimal whole number.
+export function bindPathInt(req: Request, name: string): Result<int, WebError> {
+  return toInt("path parameter", name, bindPathString(req, name)?);
+}
+
+// bindPathBool(req, name): Result<bool, WebError> -- `true`/`false` (any case) or `1`/`0`; 400 otherwise.
+export function bindPathBool(req: Request, name: string): Result<bool, WebError> {
+  return toBool("path parameter", name, bindPathString(req, name)?);
+}
+
+// ---- query fields -------------------------------------------------------------------------------------------------------
+
+// bindQueryString(req, name): Result<string, WebError> -- the first value of the query field; 400 when absent.
+export function bindQueryString(req: Request, name: string): Result<string, WebError> {
+  const v = req.query(name);
+  if (v.isNone()) {
+    return Err(missing("query parameter", name));
+  }
+  return Ok(v.unwrap());
+}
+
+export function bindQueryInt(req: Request, name: string): Result<int, WebError> {
+  return toInt("query parameter", name, bindQueryString(req, name)?);
+}
+
+export function bindQueryBool(req: Request, name: string): Result<bool, WebError> {
+  return toBool("query parameter", name, bindQueryString(req, name)?);
+}
+
+// bindQueryStringOpt(req, name): Result<Option<string>, WebError> -- None when the field is absent.
+export function bindQueryStringOpt(req: Request, name: string): Result<Option<string>, WebError> {
+  return Ok(req.query(name));
+}
+
+export function bindQueryIntOpt(req: Request, name: string): Result<Option<int>, WebError> {
+  const v = req.query(name);
+  if (v.isNone()) {
+    return Ok(None);
+  }
+  return Ok(Some(toInt("query parameter", name, v.unwrap())?));
+}
+
+export function bindQueryBoolOpt(req: Request, name: string): Result<Option<bool>, WebError> {
+  const v = req.query(name);
+  if (v.isNone()) {
+    return Ok(None);
+  }
+  return Ok(Some(toBool("query parameter", name, v.unwrap())?));
+}
+
+// bindQueryStrings(req, name): Result<string[], WebError> -- every value of a repeated field (`?tag=a&tag=b`), possibly none.
+export function bindQueryStrings(req: Request, name: string): Result<string[], WebError> {
+  return Ok(req.queryAll(name));
+}
+
+export function bindQueryInts(req: Request, name: string): Result<int[], WebError> {
+  let out: int[] = [];
+  for (const t of req.queryAll(name)) {
+    out.push(toInt("query parameter", name, t)?);
+  }
+  return Ok(out);
+}
+
+// ---- header fields ------------------------------------------------------------------------------------------------------
+
+// bindHeader(req, name): Result<string, WebError> -- the first header field of that name (case-insensitive); 400 when absent.
+export function bindHeader(req: Request, name: string): Result<string, WebError> {
+  const v = req.header(name);
+  if (v.isNone()) {
+    return Err(missing("header", name));
+  }
+  return Ok(v.unwrap());
+}
+
+export function bindHeaderInt(req: Request, name: string): Result<int, WebError> {
+  return toInt("header", name, bindHeader(req, name)?);
+}
+
+export function bindHeaderBool(req: Request, name: string): Result<bool, WebError> {
+  return toBool("header", name, bindHeader(req, name)?);
+}
+
+export function bindHeaderOpt(req: Request, name: string): Result<Option<string>, WebError> {
+  return Ok(req.header(name));
+}
+
+export function bindHeaderIntOpt(req: Request, name: string): Result<Option<int>, WebError> {
+  const v = req.header(name);
+  if (v.isNone()) {
+    return Ok(None);
+  }
+  return Ok(Some(toInt("header", name, v.unwrap())?));
+}
+
+export function bindHeaderBoolOpt(req: Request, name: string): Result<Option<bool>, WebError> {
+  const v = req.header(name);
+  if (v.isNone()) {
+    return Ok(None);
+  }
+  return Ok(Some(toBool("header", name, v.unwrap())?));
+}

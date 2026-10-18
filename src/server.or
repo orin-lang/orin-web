@@ -1,0 +1,462 @@
+// The HTTP/1.1 server: `std:net` sockets, `std:http` parsing and serialization, and a `Router` in between.
+//
+// Authority. `serve` takes a `NetGrant` (from `withNet(host, ..)` in `main(host)`), narrows it to one listen address and port
+// with `useListener`, and can open no other socket. Nothing in this module reads a file, an environment variable or the clock
+// except through `std:net` (deadlines use the stream's monotonic clock).
+//
+// Shape (the same as `examples/http_server.or` of the Orin repository, which explains the details). The calling task only
+// accepts. Each accepted connection is MOVED into a bounded channel; a fixed pool of worker tasks takes connections from it, reads
+// requests, calls `Router.handle`, and writes the response. The router is copied into each worker (Orin tasks share no
+// mutable state), so handlers must not rely on shared mutable state either: a handler that needs state talks to an owner task through
+// a channel it captured (see `examples/notes` in this repository).
+//
+// Bounds. Everything is bounded and fixed at start: `workers` connections in service, `queue` waiting; head and body sizes are
+// the `HttpLimits`; every wait has a deadline. A slow or silent client occupies one worker for at most those deadlines. A streamed
+// response (server-sent events) is exempt from the request deadlines and occupies its worker until the stream ends or a write
+// fails, so size `workers` for the streams you expect.
+import { milliseconds, Duration } from "std:time";
+import {
+  Scope, TaskHandle, CancelToken, scopeNet, spawn, channel, Receiver, Sender,
+} from "std:task";
+import { Bytes, fromString, empty } from "std:bytes";
+import {
+  Headers, HttpLimits, HttpError, NeedMore, Done, Failed, RequestParser, Http11, methodName,
+  eqIgnoreCase, versionMinor, standardStatus, emptyHeaders, serializeResponse, ResponseParts,
+  hexString, defaultLimits, BodyTooLarge, StartLineTooLong, HeaderLineTooLong, HeadersTooLarge,
+  TooManyHeaders, UnsupportedVersion, httpErrorMessage, Request as HttpRequest,
+  Response as HttpResponse,
+} from "std:http";
+import {
+  NetGrant, NetError, Listener, Stream, Peer, Accepted, Cancelled, useListener, acceptDetached,
+  serveAcceptedDo, dropAccepted, portOf, recv, sendAll, shutdownWrite, monotonicMillis, isTimeout,
+  netErrorMessage,
+} from "std:net";
+import { WebError, webError, statusError, BadRequest } from "./error";
+import { Request, RequestParts } from "./request";
+import { Response, FixedBody, StreamBody } from "./response";
+import { Router } from "./router";
+
+// ServerConfig -- start from `defaultServerConfig()` and replace fields:
+//   ServerConfig { ...defaultServerConfig(), port: 8080, workers: 16 }
+//
+//   address, port        where to listen; port 0 picks a free port (reported through `ready`)
+//   workers, queue       connections served at the same time (1..256) and accepted connections waiting for a worker (1..4096)
+//   maxConnections       serve this many connections, then return; 0 = until stopped (used by tests)
+//   limits               HttpLimits for requests: start line, header count and size, body size
+//   idle                 how long a connection may wait for its next request
+//   request              the time one whole request (head and body) may take from its first byte
+//   send                 the time allowed to hand one response (or one streamed chunk) to the kernel
+//   maxRequests          requests served on one connection before it is closed
+export type ServerConfig = {
+  address: string;
+  port: int;
+  workers: int;
+  queue: int;
+  maxConnections: int;
+  limits: HttpLimits;
+  idle: Duration;
+  request: Duration;
+  send: Duration;
+  maxRequests: int;
+};
+
+// defaultServerConfig(): ServerConfig -- 127.0.0.1:8080, 8 workers, queue 16, head 32 KiB, body 1 MiB, 5 s deadlines, 100
+// requests per connection. Listening on all interfaces is a conscious choice: set `address` to "0.0.0.0".
+export function defaultServerConfig(): ServerConfig {
+  return ServerConfig {
+    address: "127.0.0.1",
+    port: 8080,
+    workers: 8,
+    queue: 16,
+    maxConnections: 0,
+    limits: HttpLimits {
+      ...defaultLimits(),
+      maxStartLine: 8192,
+      maxHeaderCount: 100,
+      maxHeaderLine: 8192,
+      maxHeaderBytes: 32768,
+    },
+    idle: milliseconds(5000),
+    request: milliseconds(5000),
+    send: milliseconds(5000),
+    maxRequests: 100,
+  };
+}
+
+// ServerHandle -- given to the `ready` callback of `serve`: the port actually bound, and a token whose `cancel()` stops the server
+// gracefully (no new connections; those accepted or queued are served to the end).
+export type ServerHandle = { port: int; stop: CancelToken; };
+
+function clamp(v: int, lo: int, hi: int): int {
+  return v < lo ? lo : v > hi ? hi : v;
+}
+
+function statusFor(e: HttpError): int {
+  return match (e.kind) {
+    BodyTooLarge => 413,
+    StartLineTooLong => 414,
+    HeaderLineTooLong => 431,
+    HeadersTooLarge => 431,
+    TooManyHeaders => 431,
+    UnsupportedVersion => 505,
+    _ => 400,
+  };
+}
+
+// The fields of `h` without the ones the server writes itself (framing and connection management).
+function withoutFraming(h: Headers): Headers {
+  let names: string[] = [];
+  let values: string[] = [];
+  let i: usize = 0;
+  while (i < h.size()) {
+    const n = h.nameAt(i);
+    if (!eqIgnoreCase(n, "content-length")
+        && !eqIgnoreCase(n, "transfer-encoding")
+        && !eqIgnoreCase(n, "connection")) {
+      names.push(n);
+      values.push(h.valueAt(i));
+    }
+    i += 1;
+  }
+  return new Headers(names, values);
+}
+
+function sendBytes(s: Stream, data: Bytes, cfg: ServerConfig): bool {
+  return sendAll(s, data, cfg.send).isOk();
+}
+
+function headText(code: int, h: Headers): string {
+  let out = "HTTP/1.1 " + code.toString() + " " + standardStatus(code).reason() + "\r\n";
+  let i: usize = 0;
+  while (i < h.size()) {
+    out += h.nameAt(i) + ": " + h.valueAt(i) + "\r\n";
+    i += 1;
+  }
+  return out + "\r\n";
+}
+
+function bodyless(code: int): bool {
+  return code < 200 || code == 204 || code == 304;
+}
+
+// Writes a fixed response: false when it could not be sent. HEAD and bodyless statuses get the head only; for HEAD the
+// Content-Length is that of the body that GET would send.
+function writeFixed(
+  s: Stream,
+  headers: Headers,
+  code: int,
+  body: Bytes,
+  isHead: bool,
+  closeIt: bool,
+  cfg: ServerConfig,
+): bool {
+  let h = withoutFraming(headers);
+  if (code >= 200 && code != 204 && code != 304) {
+    h.add("Content-Length", body.length().toString()).unwrap();
+  }
+  if (closeIt) {
+    h.add("Connection", "close").unwrap();
+  }
+  const parts = ResponseParts {
+    status: standardStatus(code),
+    version: Http11,
+    headers: h,
+    body: isHead || bodyless(code) ? empty() : body,
+    trailers: emptyHeaders(),
+    forHead: isHead,
+  };
+  const r = HttpResponse.tryNew(parts);
+  if (r.isErr()) {
+    return false;
+  }
+  return sendBytes(s, serializeResponse(r.unwrap()), cfg);
+}
+
+// Writes a streamed body: the head, then each chunk the source yields (chunked for HTTP/1.1, up to the close for HTTP/1.0).
+// An empty chunk is skipped: in chunked coding it would end the body.
+function writeStream(
+  s: Stream,
+  code: int,
+  headers: Headers,
+  next: () => Option<Bytes>,
+  chunked: bool,
+  cfg: ServerConfig,
+): void {
+  let h = withoutFraming(headers);
+  h.add("Connection", "close").unwrap();
+  if (chunked) {
+    h.add("Transfer-Encoding", "chunked").unwrap();
+  }
+  if (!sendBytes(s, fromString(headText(code, h)), cfg)) {
+    return;
+  }
+  let going = true;
+  while (going) {
+    const c = next();
+    if (c.isNone()) {
+      going = false;
+    } else if (c.unwrap().length() > 0) {
+      const data = c.unwrap();
+      const frame = chunked
+          ? fromString(hexString(data.length()) + "\r\n").concat(data).concat(fromString("\r\n"))
+          : data;
+      if (!sendBytes(s, frame, cfg)) {
+        going = false;
+      }
+    }
+  }
+  if (chunked) {
+    sendBytes(s, fromString("0\r\n\r\n"), cfg);
+  }
+}
+
+// Writes one response; true when the connection can serve another request. A streamed response always ends the connection.
+function writeResponse(
+  s: Stream,
+  res: Response,
+  isHead: bool,
+  http10: bool,
+  closeIt: bool,
+  cfg: ServerConfig,
+): bool {
+  const code = res.status();
+  return match (res.body()) {
+    StreamBody(next) => {
+      if (isHead || bodyless(code)) {
+        writeFixed(s, res.headers(), code, empty(), isHead, true, cfg);
+        return false;
+      }
+      writeStream(s, code, res.headers(), next, !http10, cfg);
+      return false;
+    },
+    FixedBody(b) => writeFixed(s, res.headers(), code, b, isHead, closeIt, cfg) && !closeIt,
+  };
+}
+
+// After an error answer: FIN, then drop what the client still sends for at most 200 ms, so the OS does not answer unread data
+// with a reset that destroys the response.
+function drain(s: Stream): void {
+  shutdownWrite(s);
+  const end = monotonicMillis(s) + 200;
+  let n: int = 0;
+  while (monotonicMillis(s) < end && n < 16) {
+    const r = recv(s, 4096, milliseconds(50));
+    if (r.isErr()) {
+      n = 16;
+    } else {
+      n += 1;
+    }
+  }
+}
+
+// Answers a refused request with the router's error handler and ends the connection.
+function refuse(s: Stream, app: Router, err: WebError, cfg: ServerConfig): void {
+  const res = app.fail(err);
+  writeResponse(s, res, false, false, true, cfg);
+  drain(s);
+}
+
+// One connection: requests until the client goes away, asks for close, or does something wrong.
+function serveConnection(s: Stream, peer: Peer, app: Router, cfg: ServerConfig): void {
+  let parser = new RequestParser(cfg.limits);
+  const none = empty();
+  let carry: Bytes = none;
+  let served: int = 0;
+  while (served < cfg.maxRequests) {
+    parser.reset();
+    let first = true;
+    let deadline: int = 0;
+    let req: Option<HttpRequest> = None;
+    let fail: int = 0;
+    let failText = "";
+    let quit = false;
+    while (req.isNone() && fail == 0 && !quit) {
+      let chunk: Bytes = none;
+      if (carry.length() > 0) {
+        chunk = carry;
+        carry = none;
+      } else {
+        const wait = first ? cfg.idle.millis : deadline - monotonicMillis(s);
+        if (wait <= 0) {
+          fail = 408;
+          failText = "request timed out";
+        } else {
+          const r = recv(s, 16384, milliseconds(wait));
+          match (r) {
+            Ok(b) => {
+              chunk = b;
+            },
+            Err(e) => {
+              if (isTimeout(e) && !first) {
+                fail = 408;
+                failText = "request timed out";
+              } else {
+                quit = true;
+              }
+            },
+          }
+        }
+      }
+      if (chunk.length() > 0) {
+        if (first) {
+          first = false;
+          deadline = monotonicMillis(s) + cfg.request.millis;
+        }
+        match (parser.feed(chunk)) {
+          NeedMore => {},
+          Done(rq, used) => {
+            req = Some(rq);
+            carry = chunk.slice(used, chunk.length());
+          },
+          Failed(e) => {
+            fail = statusFor(e);
+            failText = httpErrorMessage(e);
+          },
+        }
+      }
+    }
+    if (fail != 0) {
+      refuse(s, app, statusError(fail, failText), cfg);
+      return;
+    }
+    if (quit) {
+      return;
+    }
+    const rq = req.unwrap();
+    const built = Request.tryNew(RequestParts {
+      method: rq.method(),
+      target: rq.target(),
+      headers: rq.headers(),
+      body: rq.body(),
+    });
+    if (built.isErr()) {
+      refuse(s, app, built.unwrapErr(), cfg);
+      return;
+    }
+    const res = app.handle(built.unwrap().withAttr("peer", peer.host));
+    const conn = rq.headers().get("connection");
+    served += 1;
+    const http10 = versionMinor(rq.version()) == 0;
+    const closeIt = http10
+        || conn.isSome() && eqIgnoreCase(conn.unwrap(), "close")
+        || served >= cfg.maxRequests;
+    const again = writeResponse(s, res, methodName(rq.method()) == "HEAD", http10, closeIt, cfg);
+    if (!again) {
+      drain(s);
+      return;
+    }
+  }
+}
+
+// A worker: serves the connections it receives until the channel is closed and empty.
+function workerLoop(rx: Receiver<Accepted>, app: Router, cfg: ServerConfig): int {
+  let served: int = 0;
+  let going = true;
+  while (going) {
+    const next = rx.recv();
+    match (next) {
+      Some(a) => {
+        serveAcceptedDo(
+          a,
+          (s: Stream, peer: Peer) => {
+            serveConnection(s, peer, app, cfg);
+          },
+        );
+        served += 1;
+      },
+      None => {
+        going = false;
+      },
+    }
+  }
+  return served;
+}
+
+// The accepting task: moves each connection into the queue. Returns the number accepted.
+function acceptLoop(ln: Listener, tx: Sender<Accepted>, maxConns: int): int {
+  let n: int = 0;
+  let going = true;
+  while (going && (maxConns == 0 || n < maxConns)) {
+    const r = acceptDetached(ln, milliseconds(1000));
+    match (r) {
+      Ok(a) => {
+        n += 1;
+        if (tx.send(a).isErr()) {
+          dropAccepted(a);
+        }
+      },
+      Err(e) => {
+        if (e.kind == Cancelled) {
+          going = false;
+        } else if (!isTimeout(e)) {
+          console.error("orin-web: accept: " + netErrorMessage(e));
+        }
+      },
+    }
+  }
+  return n;
+}
+
+// The pool, inside scope `s`: the workers, and (in this task) the accept loop, which runs in the nested scope `acc` so that its
+// token stops the accepting alone. Shutdown is in dependency order: stop accepting, let the workers finish what they hold.
+function runPool(
+  s: Scope,
+  acc: Scope,
+  ln: Listener,
+  app: Router,
+  cfg: ServerConfig,
+  ready: (h: ServerHandle) => void,
+): void {
+  const conns = channel<Accepted>(cfg.queue.toUsize());
+  let hs: TaskHandle<int>[] = [];
+  let i: int = 0;
+  while (i < cfg.workers) {
+    const rx = conns.rx;
+    hs.push(spawn(s, () => workerLoop(rx, app, cfg)));
+    i += 1;
+  }
+  ready(ServerHandle { port: portOf(ln), stop: acc.token() });
+  acceptLoop(ln, conns.tx, cfg.maxConnections);
+  conns.tx.close();
+  for (const h of hs) {
+    h.join();
+  }
+  conns.rx.close();
+}
+
+// serve(net, app, config, ready): Result<void, NetError> -- listens on `config.address:config.port` and serves `app` until
+// `maxConnections` connections were served or `ServerHandle.stop` is cancelled; then returns Ok. Err when the address cannot be bound
+// (or is outside what `net` allows). `ready` is called once, from the serving task, after the socket is listening and the
+// workers are running: print the port or hand the handle to another task there. `workers` is clamped to 1..256 and `queue` to
+// 1..4096.
+export function serve(
+  net: NetGrant,
+  app: Router,
+  requested: ServerConfig,
+  ready: (h: ServerHandle) => void,
+): Result<void, NetError> {
+  const config = ServerConfig {
+    ...requested,
+    workers: clamp(requested.workers, 1, 256),
+    queue: clamp(requested.queue, 1, 4096),
+  };
+  return scopeNet(
+    net,
+    (s: Scope, g: NetGrant): Result<void, NetError> => {
+      return scopeNet(
+        g,
+        (acc: Scope, g2: NetGrant): Result<void, NetError> => {
+          return useListener(
+            g2,
+            config.address,
+            config.port,
+            128,
+            (ln: Listener) => {
+              runPool(s, acc, ln, app, config, ready);
+            },
+          );
+        },
+      );
+    },
+  );
+}

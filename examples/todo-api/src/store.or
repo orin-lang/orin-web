@@ -1,0 +1,43 @@
+// The todo list as a plain value with pure operations: no HTTP, no JSON, no tasks. The service keeps exactly one of these, inside
+// the owner task (state.or).
+
+export type Todo = { id: int; title: string; done: bool; };
+export type Store = { todos: Todo[]; next: int; };
+
+export function emptyStore(): Store {
+  return Store { todos: [], next: 1 };
+}
+
+// Appends a todo with the next id (ids start at 1 and are never reused).
+export function addTodo(s: Store, title: string): Store {
+  let todos: Todo[] = [];
+  for (const t of s.todos) {
+    todos.push(t);
+  }
+  todos.push(Todo { id: s.next, title: title, done: false });
+  return Store { todos: todos, next: s.next + 1 };
+}
+
+export function findTodo(s: Store, id: int): Option<Todo> {
+  for (const t of s.todos) {
+    if (t.id == id) {
+      return Some(t);
+    }
+  }
+  return None;
+}
+
+// Flips `done` of one todo. The store is unchanged when there is no such todo.
+export function toggleTodo(s: Store, id: int): Store {
+  return Store {
+    todos: s.todos.map(t => t.id == id ? Todo { id: t.id, title: t.title, done: !t.done } : t),
+    next: s.next,
+  };
+}
+
+export function removeTodo(s: Store, id: int): Store {
+  return Store { todos: s.todos.filter(t => t.id != id), next: s.next };
+}
+
+// The body of a request that creates a todo.
+export type NewTodo = { title: string; };

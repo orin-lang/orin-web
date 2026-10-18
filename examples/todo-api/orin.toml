@@ -1,0 +1,11 @@
+[package]
+name = "todo-api"
+version = "0.1.0"
+entry = "src/main.or"
+
+[dependencies]
+orin-web = { path = "../.." }
+
+# The processors of orin-web (@Service, @Controller) run for this package.
+[annotations]
+processors = ["orin-web"]

@@ -1,0 +1,26 @@
+// expect: ghost
+import { Controller, Get, Service } from "orin-web";
+
+export class Ghost {
+  constructor(public n: int) {}
+}
+
+@Service
+export class Real {
+  constructor(public n: int) {}
+  static create(): Real {
+    return new Real(1);
+  }
+}
+
+@Controller("/x")
+export class C {
+  constructor(public g: Ghost) {}
+  static create(g: Ghost): C {
+    return new C(g);
+  }
+  @Get("/")
+  one(): string {
+    return "x";
+  }
+}

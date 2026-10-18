@@ -1,0 +1,16 @@
+// expect: type float cannot be written as or read from JSON
+import { Controller, Get } from "orin-web";
+
+export type Reading = { celsius: float; };
+
+@Controller("/x")
+export class C {
+  constructor(public n: int) {}
+  static create(n: int): C {
+    return new C(n);
+  }
+  @Get("/")
+  current(): Reading {
+    return Reading { celsius: 1.5 };
+  }
+}

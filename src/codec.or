@@ -1,0 +1,109 @@
+// JSON codecs for the types of controller methods. The processor generates, for every record type a method receives as `@Body` or
+// returns, an encoder `(T) => JsonValue` and a decoder `(DecodeCursor) => Result<T, DecodeError>` out of the pieces below.
+// They are ordinary functions and can be used by hand.
+//
+// Integers are limited to +-9007199254740991 (2^53-1), the range every JSON implementation represents exactly.
+import { JsonValue, ValueNull, ValueArray } from "std:json";
+import {
+  DecodeCursor, DecodeError, DecodeWrongType, decodeString, decodeBool, decodeInt, decodeArray,
+  requiredField, optionalField, cursorValue, cursorPath,
+} from "std:json/decode";
+import { jsonString, jsonInt, jsonBool, jsonNull } from "./jsonbuild";
+
+// ---- encoders -----------------------------------------------------------------------------------------------------------
+
+// encArray(xs, enc) -- a JSON array.
+export function encArray<T>(xs: T[], enc: (x: T) => JsonValue): JsonValue {
+  let items: JsonValue[] = [];
+  for (const x of xs) {
+    items.push(enc(x));
+  }
+  return ValueArray(items);
+}
+
+// encOption(o, enc) -- `null` for None.
+export function encOption<T>(o: Option<T>, enc: (x: T) => JsonValue): JsonValue {
+  if (o.isNone()) {
+    return jsonNull();
+  }
+  return enc(o.unwrap());
+}
+
+// ---- decoders -----------------------------------------------------------------------------------------------------------
+
+export function decStr(c: DecodeCursor): Result<string, DecodeError> {
+  return decodeString(c);
+}
+
+export function decInt(c: DecodeCursor): Result<int, DecodeError> {
+  return decodeInt(c, -9007199254740991, 9007199254740991);
+}
+
+export function decBool(c: DecodeCursor): Result<bool, DecodeError> {
+  return decodeBool(c);
+}
+
+// decArr(c, dec) -- a JSON array, each element decoded with `dec`.
+export function decArr<T>(
+  c: DecodeCursor,
+  dec: (e: DecodeCursor) => Result<T, DecodeError>,
+): Result<T[], DecodeError> {
+  const items = decodeArray(c)?;
+  let out: T[] = [];
+  for (const e of items) {
+    out.push(dec(e)?);
+  }
+  return Ok(out);
+}
+
+// decField(parent, key, dec) -- the required member `key` of an object, decoded with `dec`.
+export function decField<T>(
+  parent: DecodeCursor,
+  key: string,
+  dec: (c: DecodeCursor) => Result<T, DecodeError>,
+): Result<T, DecodeError> {
+  return dec(requiredField(parent, key)?);
+}
+
+// decFieldOpt(parent, key, dec) -- `None` for an absent member or `null`.
+export function decFieldOpt<T>(
+  parent: DecodeCursor,
+  key: string,
+  dec: (c: DecodeCursor) => Result<T, DecodeError>,
+): Result<Option<T>, DecodeError> {
+  const found = optionalField(parent, key)?;
+  if (found.isNone()) {
+    return Ok(None);
+  }
+  const isNull = match (cursorValue(found.unwrap())) {
+    ValueNull => true,
+    _ => false,
+  };
+  if (isNull) {
+    return Ok(None);
+  }
+  return Ok(Some(dec(found.unwrap())?));
+}
+
+// jsonPassthrough(v) -- the encoder of a value that already is JSON.
+export function jsonPassthrough(v: JsonValue): JsonValue {
+  return v;
+}
+
+// decEnum(c, names, values) -- a tag union written as its variant name: the value whose name the string equals.
+export function decEnum<T>(c: DecodeCursor, names: string[], values: T[]): Result<T, DecodeError> {
+  const s = decodeString(c)?;
+  let i: usize = 0;
+  while (i < names.length) {
+    if (names[i] == s) {
+      return Ok(values[i]);
+    }
+    i += 1;
+  }
+  return Err(DecodeError {
+    kind: DecodeWrongType,
+    path: cursorPath(c),
+    expected: "one of " + names.join(", "),
+    actual: "string",
+  });
+}

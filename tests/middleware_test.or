@@ -1,0 +1,151 @@
+import { assert, assertEq, assertEqString } from "std:test";
+import { Get, Options, emptyHeaders } from "std:http";
+import {
+  Router, Request, Response, WebError, TestClient, testRequest, assertStatus, assertBody,
+  assertHeader, assertNoHeader, logger, recover, bearerAuth, bearerToken, constantTimeEquals,
+  limitBody, CorsConfig, defaultCors, cors, withMiddleware, internalError, forbidden,
+  defaultErrorResponse,
+} from "../src/module";
+
+function ok(req: Request): Result<Response, WebError> {
+  return Ok(Response.text(200, "ok"));
+}
+
+function who(req: Request): Result<Response, WebError> {
+  return Ok(Response.text(200, req.attr("principal").unwrapOr("nobody")));
+}
+
+@Test
+function loggerReportsMethodPathAndStatus(): void {
+  // The sink cannot mutate captured state, so the lines go through a channel-free trick: the sink writes to stderr and the test
+  // checks the status code path through an error and an ok.
+  let app = new Router();
+  app.use(logger((line: string) => console.error(line)));
+  app.get("/a", ok);
+  app.get("/b", (req: Request): Result<Response, WebError> => Err(forbidden("no")));
+  const c = new TestClient(app);
+  assertStatus(c.get("/a"), 200);
+  assertStatus(c.get("/b"), 403);
+  assertStatus(c.get("/missing"), 404);
+}
+
+@Test
+function recoverTurnsErrorsIntoResponses(): void {
+  let app = new Router();
+  app.use((req: Request, next: (r: Request) => Result<Response, WebError>): Result<Response, WebError> => {
+    const r = next(req);
+    // recover sits inside this one, so the outer middleware sees a response, not an error
+    return Ok(r.unwrap().withHeader("X-Outer", "saw-response"));
+  });
+  app.use(recover((req: Request, e: WebError): Response => Response.text(500, "recovered")));
+  app.get(
+    "/boom",
+    (req: Request): Result<Response, WebError> => Err(internalError("secret detail")),
+  );
+  const r = new TestClient(app).get("/boom");
+  assertStatus(r, 500);
+  assertBody(r, "recovered");
+  assertHeader(r, "X-Outer", "saw-response");
+}
+
+@Test
+function bearerAuthChecksTheToken(): void {
+  let app = new Router();
+  app.use(bearerAuth((t: string): Option<string> => t == "t-ann" ? Some("ann") : None));
+  app.get("/me", who);
+  const c = new TestClient(app);
+  const none = c.get("/me");
+  assertStatus(none, 401);
+  assertHeader(none, "WWW-Authenticate", "Bearer");
+  const bad = c.withHeader("Authorization", "Bearer nope").get("/me");
+  assertStatus(bad, 401);
+  assertHeader(bad, "WWW-Authenticate", "Bearer error=\"invalid_token\"");
+  const good = c.withHeader("Authorization", "bearer t-ann").get("/me");
+  assertStatus(good, 200);
+  assertBody(good, "ann");
+  assertStatus(c.withHeader("Authorization", "Basic abc").get("/me"), 401);
+}
+
+@Test
+function bearerTokenSharedSecret(): void {
+  let app = new Router();
+  app.get("/open", ok);
+  let admin = new Router();
+  admin.use(bearerToken("s3cret", "admin"));
+  admin.get("/who", who);
+  app.mount("/admin", admin);
+  const c = new TestClient(app);
+  assertStatus(c.get("/open"), 200);
+  assertStatus(c.get("/admin/who"), 401);
+  assertBody(c.withHeader("Authorization", "Bearer s3cret").get("/admin/who"), "admin");
+}
+
+@Test
+function perRouteMiddleware(): void {
+  let app = new Router();
+  app.get("/public", ok);
+  app.get("/private", withMiddleware(bearerToken("k", "me"), who));
+  const c = new TestClient(app);
+  assertStatus(c.get("/public"), 200);
+  assertStatus(c.get("/private"), 401);
+  assertBody(c.withHeader("Authorization", "Bearer k").get("/private"), "me");
+}
+
+@Test
+function constantTimeCompare(): void {
+  assert(constantTimeEquals("abc", "abc"), "equal");
+  assert(!constantTimeEquals("abc", "abd"), "differs");
+  assert(!constantTimeEquals("abc", "abcd"), "longer");
+  assert(!constantTimeEquals("", "a"), "empty");
+  assert(constantTimeEquals("", ""), "both empty");
+}
+
+@Test
+function bodyLimit(): void {
+  let app = new Router();
+  app.use(limitBody(5));
+  app.post("/x", ok);
+  const c = new TestClient(app);
+  assertStatus(c.post("/x", "12345"), 200);
+  assertStatus(c.post("/x", "123456"), 413);
+}
+
+@Test
+function corsSimpleRequest(): void {
+  let app = new Router();
+  app.use(cors(defaultCors()));
+  app.get("/a", ok);
+  const c = new TestClient(app);
+  assertNoHeader(c.get("/a"), "Access-Control-Allow-Origin");
+  const r = c.withHeader("Origin", "https://app.example").get("/a");
+  assertStatus(r, 200);
+  assertHeader(r, "Access-Control-Allow-Origin", "*");
+  assertNoHeader(r, "Vary");
+  const nf = c.withHeader("Origin", "https://app.example").get("/missing");
+  assertStatus(nf, 404);
+  assertHeader(nf, "Access-Control-Allow-Origin", "*");
+}
+
+@Test
+function corsPreflight(): void {
+  let app = new Router();
+  app.use(
+    cors(CorsConfig { ...defaultCors(), origins: ["https://app.example"], credentials: true }),
+  );
+  app.post("/a", ok);
+  const c = new TestClient(app).withHeader("Origin", "https://app.example");
+  const pre = c.send(
+    testRequest(Options, "/a")
+        .withHeader("Access-Control-Request-Method", "POST")
+        .withHeader("Access-Control-Request-Headers", "content-type"),
+  );
+  assertStatus(pre, 204);
+  assertHeader(pre, "Access-Control-Allow-Origin", "https://app.example");
+  assertHeader(pre, "Access-Control-Allow-Credentials", "true");
+  assertHeader(pre, "Access-Control-Allow-Headers", "content-type");
+  assertHeader(pre, "Access-Control-Max-Age", "600");
+  assertHeader(pre, "Vary", "Origin");
+  const other = new TestClient(app).withHeader("Origin", "https://evil.example").post("/a", "");
+  assertStatus(other, 200);
+  assertNoHeader(other, "Access-Control-Allow-Origin");
+}

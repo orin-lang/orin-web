@@ -1,0 +1,115 @@
+// orin-web errors. A handler returns `Result<Response, WebError>`; a `WebError` is a failure the client should see as an
+// HTTP status. The router turns it into a response with the error handler (see router.or), so a handler can use `?` on
+// every step that may fail for a reason of the request.
+//
+// ADR-0048 section 3.1: one error type per module, `kind`, and a renderer `webErrorMessage`.
+import { Headers, emptyHeaders } from "std:http";
+
+export type WebErrorKind =
+  BadRequest
+  | Unauthorized
+  | Forbidden
+  | NotFound
+  | MethodNotAllowed
+  | NotAcceptable
+  | PayloadTooLarge
+  | UnsupportedMediaType
+  | Unprocessable
+  | Internal
+  | Other(int);
+
+// kind: what went wrong. detail: text for the client ("" = the standard reason phrase). headers: extra response fields the
+// error handler copies into the response (`Allow` for 405, `WWW-Authenticate` for 401).
+export type WebError = { kind: WebErrorKind; detail: string; headers: Headers; };
+
+// webErrorStatus(e): int -- the HTTP status of the error: 400, 401, 403, 404, 405, 406, 413, 415, 422, 500, or the code of
+// `Other(code)` (clamped to 400..599). O(1).
+export function webErrorStatus(e: WebError): int {
+  return match (e.kind) {
+    BadRequest => 400,
+    Unauthorized => 401,
+    Forbidden => 403,
+    NotFound => 404,
+    MethodNotAllowed => 405,
+    NotAcceptable => 406,
+    PayloadTooLarge => 413,
+    UnsupportedMediaType => 415,
+    Unprocessable => 422,
+    Internal => 500,
+    Other(code) => code < 400 ? 400 : code > 599 ? 599 : code,
+  };
+}
+
+function reasonOf(code: int): string {
+  return match (code) {
+    400 => "Bad Request",
+    401 => "Unauthorized",
+    403 => "Forbidden",
+    404 => "Not Found",
+    405 => "Method Not Allowed",
+    406 => "Not Acceptable",
+    408 => "Request Timeout",
+    409 => "Conflict",
+    410 => "Gone",
+    413 => "Payload Too Large",
+    415 => "Unsupported Media Type",
+    422 => "Unprocessable Content",
+    429 => "Too Many Requests",
+    500 => "Internal Server Error",
+    501 => "Not Implemented",
+    502 => "Bad Gateway",
+    503 => "Service Unavailable",
+    _ => code < 500 ? "Client Error" : "Server Error",
+  };
+}
+
+// webErrorMessage(e): string -- the text shown to the client: `detail`, or the reason phrase of the status. Never empty.
+@Ensures(result.length > 0)
+export function webErrorMessage(e: WebError): string {
+  return e.detail.length > 0 ? e.detail : reasonOf(webErrorStatus(e));
+}
+
+// webError(kind, detail): WebError -- an error without extra headers.
+export function webError(kind: WebErrorKind, detail: string): WebError {
+  return WebError { kind: kind, detail: detail, headers: emptyHeaders() };
+}
+
+// withErrorHeader(e, name, value): WebError -- `e` with one more response field. A name or value that is not valid HTTP
+// is ignored (the field is dropped, the error stays what it was): error construction must not fail again.
+export function withErrorHeader(e: WebError, name: string, value: string): WebError {
+  let h = e.headers;
+  const r = h.add(name, value);
+  if (r.isErr()) {
+    return e;
+  }
+  return WebError { kind: e.kind, detail: e.detail, headers: h };
+}
+
+export function badRequest(detail: string): WebError {
+  return webError(BadRequest, detail);
+}
+
+export function unauthorized(detail: string): WebError {
+  return webError(Unauthorized, detail);
+}
+
+export function forbidden(detail: string): WebError {
+  return webError(Forbidden, detail);
+}
+
+export function notFound(detail: string): WebError {
+  return webError(NotFound, detail);
+}
+
+export function unprocessable(detail: string): WebError {
+  return webError(Unprocessable, detail);
+}
+
+export function internalError(detail: string): WebError {
+  return webError(Internal, detail);
+}
+
+// statusError(code, detail): WebError -- an error with any status in 400..599 (anything else is clamped).
+export function statusError(code: int, detail: string): WebError {
+  return webError(Other(code), detail);
+}

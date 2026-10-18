@@ -1,0 +1,172 @@
+// Testing without a socket. `TestClient` drives a `Router` through exactly the code path a server uses (`Router.handle`), so a
+// test sees the same middleware, errors and statuses as a client would. Nothing here needs a grant.
+//
+//   const client = new TestClient(app).withHeader("Authorization", "Bearer secret");
+//   const res = client.get("/users/7");
+//   assertStatus(res, 200);
+//   assertBody(res, "{\"id\":7}");
+//
+// The client is a value: `withHeader` returns a changed copy. A `HEAD` response has its body removed, like on the wire.
+import {
+  Method, Get, Post, Put, Patch, Delete, Head, Options, Headers, emptyHeaders,
+} from "std:http";
+import { Bytes, empty, fromString } from "std:bytes";
+import { JsonValue, writeDocument, defaultLimits } from "std:json";
+import { assert, assertEq, assertEqString } from "std:test";
+import { WebError } from "./error";
+import { Request, RequestParts } from "./request";
+import { Response, FixedBody, StreamBody } from "./response";
+import { Router } from "./router";
+import { SseEvent, parseSseEvents } from "./sse";
+
+// testRequest(method, target): Request -- a request without body or headers. Traps when `target` is not a valid path with query
+// ("/users/7?x=1"): a test with a typo should fail.
+export function testRequest(method: Method, target: string): Request {
+  return Request
+      .tryNew(RequestParts {
+        method: method,
+        target: target,
+        headers: emptyHeaders(),
+        body: empty(),
+      })
+      .unwrap();
+}
+
+export class TestClient {
+  private app: Router;
+  private defaults: Headers;
+
+  constructor(app: Router) {
+    this.app = app;
+    this.defaults = emptyHeaders();
+  }
+
+  // withHeader(name, value): TestClient -- a client that sends this field with every request.
+  withHeader(name: string, value: string): TestClient {
+    let c = this;
+    c.defaults.set(name, value).unwrap();
+    return c;
+  }
+
+  // send(req): Response -- the response of the router to `req` (the client's default fields are added unless `req` has them).
+  send(req: Request): Response {
+    let r = req;
+    let i: usize = 0;
+    while (i < this.defaults.size()) {
+      if (!r.headers().has(this.defaults.nameAt(i))) {
+        r = r.withHeader(this.defaults.nameAt(i), this.defaults.valueAt(i));
+      }
+      i += 1;
+    }
+    const res = this.app.handle(r);
+    if (r.methodText() == "HEAD") {
+      return res.withBody(empty());
+    }
+    return res;
+  }
+
+  // exec(method, target, headers, body) -- builds the request like a server would: a target that is not a valid path or has a
+  // malformed escape is answered by the router's error handler (400), not trapped.
+  private exec(method: Method, target: string, headers: Headers, body: Bytes): Response {
+    const built = Request.tryNew(RequestParts {
+      method: method,
+      target: target,
+      headers: headers,
+      body: body,
+    });
+    if (built.isErr()) {
+      return this.app.fail(built.unwrapErr());
+    }
+    return this.send(built.unwrap());
+  }
+
+  // request(method, target, body) -- a request with a text body.
+  request(method: Method, target: string, body: string): Response {
+    return this.exec(method, target, emptyHeaders(), fromString(body));
+  }
+
+  get(target: string): Response {
+    return this.exec(Get, target, emptyHeaders(), empty());
+  }
+
+  head(target: string): Response {
+    return this.exec(Head, target, emptyHeaders(), empty());
+  }
+
+  delete(target: string): Response {
+    return this.exec(Delete, target, emptyHeaders(), empty());
+  }
+
+  options(target: string): Response {
+    return this.exec(Options, target, emptyHeaders(), empty());
+  }
+
+  post(target: string, body: string): Response {
+    return this.request(Post, target, body);
+  }
+
+  put(target: string, body: string): Response {
+    return this.request(Put, target, body);
+  }
+
+  patch(target: string, body: string): Response {
+    return this.request(Patch, target, body);
+  }
+
+  // postJson(target, value) -- POST with `application/json`. Traps when the value cannot be written (a test bug).
+  postJson(target: string, value: JsonValue): Response {
+    const text = writeDocument(value, defaultLimits()).unwrap();
+    let h = emptyHeaders();
+    h.set("Content-Type", "application/json").unwrap();
+    return this.exec(Post, target, h, fromString(text));
+  }
+}
+
+// readStream(res, maxChunks): Bytes -- the body of a response: the fixed body, or at most `maxChunks` chunks of a stream (an
+// event stream may never end; the test says how much it wants).
+export function readStream(res: Response, maxChunks: usize): Bytes {
+  return match (res.body()) {
+    FixedBody(b) => b,
+    StreamBody(next) => {
+      let all = empty();
+      let n: usize = 0;
+      while (n < maxChunks) {
+        const c = next();
+        if (c.isNone()) {
+          n = maxChunks;
+        } else {
+          all = all.concat(c.unwrap());
+          n += 1;
+        }
+      }
+      return all;
+    },
+  };
+}
+
+// readEvents(res, maxEvents): SseEvent[] -- up to `maxEvents` events of a `text/event-stream` response.
+export function readEvents(res: Response, maxEvents: usize): SseEvent[] {
+  return parseSseEvents(readStream(res, maxEvents).toRawString());
+}
+
+// assertStatus(res, code) -- traps unless the status is `code`.
+export function assertStatus(res: Response, code: int): void {
+  assertEq(res.status(), code, "status");
+}
+
+// assertBody(res, text) -- traps unless the fixed body is exactly `text`.
+export function assertBody(res: Response, text: string): void {
+  assertEqString(res.bodyText(), text, "body");
+}
+
+// assertHeader(res, name, value) -- traps unless the first field `name` has this value.
+export function assertHeader(res: Response, name: string, value: string): void {
+  const h = res.header(name);
+  assert(h.isSome(), "header " + name + " is missing");
+  assertEqString(h.unwrap(), value, "header " + name);
+}
+
+// assertNoHeader(res, name) -- traps if the response has a field `name`.
+export function assertNoHeader(res: Response, name: string): void {
+  assert(!res.headers().has(name), "header " + name + " should be absent");
+}

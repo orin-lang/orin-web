@@ -1,0 +1,60 @@
+// The owner task. Orin tasks share no mutable state, so the one store lives in ONE task and the request handlers talk to it
+// through a channel. A handler runs on a worker task of the server; the `Sender<Command>` it captured is how it reaches the
+// owner. The owner answers one command at a time, which makes every request atomic.
+import { Sender, Receiver, channel } from "std:task";
+import { Store, Todo, emptyStore, addTodo, findTodo, toggleTodo, removeTodo } from "./store";
+
+export type Op = OpList | OpAdd | OpToggle | OpRemove;
+export type Reply = Listed(Todo[]) | One(Todo) | Absent;
+export type Command = { op: Op; id: int; title: string; reply: Sender<Reply>; };
+
+// Runs until the command channel is closed and drained.
+export function ownerLoop(commands: Receiver<Command>): int {
+  let store = emptyStore();
+  let handled: int = 0;
+  let going = true;
+  while (going) {
+    const next = commands.recv();
+    match (next) {
+      Some(c) => {
+        match (c.op) {
+          OpList => {
+            c.reply.send(Listed(store.todos));
+          },
+          OpAdd => {
+            store = addTodo(store, c.title);
+            c.reply.send(One(store.todos[store.todos.length - 1]));
+          },
+          OpToggle => {
+            store = toggleTodo(store, c.id);
+            const t = findTodo(store, c.id);
+            c.reply.send(t.isSome() ? One(t.unwrap()) : Absent);
+          },
+          OpRemove => {
+            const had = findTodo(store, c.id);
+            store = removeTodo(store, c.id);
+            c.reply.send(had.isSome() ? One(had.unwrap()) : Absent);
+          },
+        }
+        handled += 1;
+      },
+      None => {
+        going = false;
+      },
+    }
+  }
+  return handled;
+}
+
+// One round trip with the owner. `None` when the service is shutting down.
+export function ask(commands: Sender<Command>, op: Op, id: int, title: string): Option<Reply> {
+  const reply = channel<Reply>(1);
+  const sent = commands.send(Command { op: op, id: id, title: title, reply: reply.tx });
+  if (sent.isErr()) {
+    return None;
+  }
+  const got = reply.rx.recv();
+  reply.rx.close();
+  reply.tx.close();
+  return got;
+}

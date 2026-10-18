@@ -1,0 +1,141 @@
+import { assert, assertEq, assertEqString } from "std:test";
+import { fromString } from "std:bytes";
+import { channel } from "std:task";
+import { ValueArray, ValueNull } from "std:json";
+import {
+  Response, jsonObject, jsonMember, jsonString, jsonInt, jsonBool, jsonArray, jsonNull,
+  webErrorStatus, sseData, sseEvent, SseEvent, readStream, readEvents, sseEncode, sseComment,
+  parseSseEvents, Router, Request, WebError, TestClient, assertBody, assertHeader, assertStatus,
+} from "../src/module";
+
+@Test
+function textHtmlAndBytes(): void {
+  const t = Response.text(201, "hi");
+  assertEq(t.status(), 201, "status");
+  assertEqString(t.reason(), "Created", "reason");
+  assertEqString(t.header("content-type").unwrap(), "text/plain; charset=utf-8", "type");
+  assertEqString(t.bodyText(), "hi", "body");
+  assertEqString(
+    Response.html(200, "<p>x</p>").header("Content-Type").unwrap(),
+    "text/html; charset=utf-8",
+    "html",
+  );
+  assertEqString(
+    Response.bytes(200, "image/png", fromString("\x89PNG")).header("Content-Type").unwrap(),
+    "image/png",
+    "bytes",
+  );
+  assertEq(Response.empty(204).bodyBytes().length().toInt(), 0, "empty");
+}
+
+@Test
+function statusOutsideTheRangeBecomes500(): void {
+  assertEq(Response.empty(99).status(), 500, "low");
+  assertEq(Response.empty(600).status(), 500, "high");
+  assertEq(Response.empty(404).withStatus(200).status(), 200, "withStatus");
+}
+
+@Test
+function jsonResponses(): void {
+  const body = jsonObject([
+    jsonMember("id", jsonInt(7)),
+    jsonMember("name", jsonString("a \"quoted\" name")),
+    jsonMember("ok", jsonBool(true)),
+    jsonMember("tags", jsonArray([jsonString("x"), jsonNull()])),
+  ]);
+  const r = Response.json(200, body).unwrap();
+  assertEqString(r.header("Content-Type").unwrap(), "application/json", "type");
+  assertEqString(
+    r.bodyText(),
+    "{\"id\":7,\"name\":\"a \\\"quoted\\\" name\",\"ok\":true,\"tags\":[\"x\",null]}",
+    "text",
+  );
+}
+
+@Test
+function headerBuilders(): void {
+  const r = Response
+      .text(200, "x")
+      .withHeader("X-A", "1")
+      .withHeader("X-A", "2")
+      .withAddedHeader("Vary", "Origin")
+      .withAddedHeader("Vary", "Accept");
+  assertEqString(r.headers().getAll("x-a").join(","), "2", "withHeader replaces");
+  assertEqString(r.headers().getAll("vary").join(","), "Origin,Accept", "withAddedHeader appends");
+  assert(Response.text(200, "x").tryWithHeader("Bad Name", "v").isErr(), "invalid name");
+  assert(
+    Response.text(200, "x").tryWithHeader("X", "a\r\nInjected: 1").isErr(),
+    "header injection is refused",
+  );
+  assertEqString(
+    Response.text(200, "x").withContentType("a\nb").header("content-type").unwrap(),
+    "text/plain; charset=utf-8",
+    "invalid type ignored",
+  );
+}
+
+@Test
+function redirects(): void {
+  const r = Response.redirect(303, "/login").unwrap();
+  assertEq(r.status(), 303, "status");
+  assertEqString(r.header("Location").unwrap(), "/login", "location");
+  assertEq(
+    webErrorStatus(Response.redirect(302, "/a\r\nSet-Cookie: x=1").unwrapErr()),
+    500,
+    "injection",
+  );
+}
+
+@Test
+function sseEncoding(): void {
+  assertEqString(sseEncode(sseData("hello")), "data: hello\n\n", "plain");
+  assertEqString(
+    sseEncode(sseEvent("tick", "a\nb\r\nc")),
+    "event: tick\ndata: a\ndata: b\ndata: c\n\n",
+    "multi-line",
+  );
+  const full = SseEvent { event: Some("e\nx"), data: "d", id: Some("7"), retry: Some(1500) };
+  assertEqString(sseEncode(full), "event: ex\nid: 7\nretry: 1500\ndata: d\n\n", "fields");
+  assertEqString(sseEncode(sseData("")), "data: \n\n", "empty data");
+  assertEqString(sseComment("keep\nalive"), ": keepalive\n\n", "comment");
+}
+
+@Test
+function sseParsingRoundTrips(): void {
+  const evs = [
+    sseData("one"),
+    sseEvent("tick", "two\nlines"),
+    SseEvent { event: None, data: "x", id: Some("9"), retry: None },
+  ];
+  let wire = "";
+  for (const e of evs) {
+    wire += sseEncode(e);
+  }
+  const back = parseSseEvents(": hi\n\n" + wire);
+  assertEq(back.length.toInt(), 3, "count");
+  assert(back[0] == evs[0] && back[1] == evs[1] && back[2] == evs[2], "same events");
+}
+
+@Test
+function sseResponseStreamsFromASource(): void {
+  let app = new Router();
+  app.get(
+    "/events",
+    (req: Request): Result<Response, WebError> => {
+      const ch = channel<SseEvent>(8);
+      ch.tx.send(sseData("a"));
+      ch.tx.send(sseData("b"));
+      ch.tx.send(sseData("c"));
+      ch.tx.close();
+      const rx = ch.rx;
+      return Ok(Response.sse(() => rx.recv()));
+    },
+  );
+  const res = new TestClient(app).get("/events");
+  assertStatus(res, 200);
+  assertHeader(res, "Content-Type", "text/event-stream");
+  assertHeader(res, "Cache-Control", "no-cache");
+  assert(res.isStream(), "is a stream");
+  const got = readEvents(res, 2);
+  assertEq(got.length.toInt(), 2, "read two of three");
+}

@@ -1,0 +1,42 @@
+// edge: orin-web on Orbit. Build and run:
+//
+//   orin build --target=wasm32-orbit
+//   orbit run build/dev/edge.wasm --grant log/v1 --invoke orin_main
+//
+// Each line of standard input is a request (`GET /hello/ada`, `POST /sum {"a":1,"b":2}`); the answer is printed as `STATUS body`.
+// With no input (stdin is at end of input on wasm32-orbit today) it answers a few built-in requests.
+import { Host, withStdio } from "std:host";
+import { readLine } from "std:io";
+import { handleLine, buildApp } from "./app";
+
+function demo(): string[] {
+  return [
+    "GET /hello/orbit",
+    "POST /sum {\"a\":40,\"b\":2}",
+    "POST /sum {\"a\":\"x\"}",
+    "GET /nope",
+  ];
+}
+
+function main(host: Host): void {
+  const piped = withStdio(
+    host,
+    io => {
+      let lines: string[] = [];
+      let going = true;
+      while (going) {
+        const l = readLine(io);
+        if (l.isNone()) {
+          going = false;
+        } else if (l.unwrap().length > 0) {
+          lines.push(l.unwrap());
+        }
+      }
+      return lines;
+    },
+  );
+  const app = buildApp();
+  for (const line of piped.length > 0 ? piped : demo()) {
+    console.log(line + "  =>  " + handleLine(app, line));
+  }
+}

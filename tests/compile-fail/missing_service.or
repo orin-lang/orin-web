@@ -1,0 +1,18 @@
+// expect: unknown type `Services`
+import { Controller, Get, Application } from "orin-web";
+
+export class Ghost {
+  constructor(public n: int) {}
+}
+
+@Controller("/x")
+export class C {
+  constructor(public g: Ghost) {}
+  static create(g: Ghost): C {
+    return new C(g);
+  }
+  @Get("/")
+  one(): string {
+    return "x";
+  }
+}

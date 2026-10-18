@@ -1,0 +1,43 @@
+import { assertEqString } from "std:test";
+import {
+  Router, Response, TestClient, assertStatus, assertBody, assertHeader, assertNoHeader,
+  contentTypeFor, textAsset, assetsHandler, staticResponse,
+} from "../src/module";
+
+@Test
+function contentTypes(): void {
+  assertEqString(contentTypeFor("index.html"), "text/html; charset=utf-8", "html");
+  assertEqString(
+    contentTypeFor("a/b/app.JS"),
+    "text/javascript; charset=utf-8",
+    "js, case-insensitive",
+  );
+  assertEqString(contentTypeFor("logo.svg"), "image/svg+xml", "svg");
+  assertEqString(contentTypeFor("README"), "application/octet-stream", "no extension");
+  assertEqString(contentTypeFor("x.unknown"), "application/octet-stream", "unknown");
+}
+
+@Test
+function assetsAreServedByPath(): void {
+  let app = new Router();
+  app.get(
+    "/static/*path",
+    assetsHandler(
+      [textAsset("index.html", "<h1>home</h1>"), textAsset("css/site.css", "body{}")],
+      "index.html",
+      "public, max-age=60",
+    ),
+  );
+  app.get("/robots.txt", staticResponse(Response.text(200, "User-agent: *")));
+  const c = new TestClient(app);
+  const css = c.get("/static/css/site.css");
+  assertStatus(css, 200);
+  assertBody(css, "body{}");
+  assertHeader(css, "Content-Type", "text/css; charset=utf-8");
+  assertHeader(css, "Cache-Control", "public, max-age=60");
+  assertBody(c.get("/static"), "<h1>home</h1>");
+  assertStatus(c.get("/static/missing.js"), 404);
+  assertStatus(c.get("/static/css/../css/site.css"), 404);
+  assertBody(c.get("/robots.txt"), "User-agent: *");
+  assertNoHeader(c.get("/robots.txt"), "Cache-Control");
+}

@@ -1,0 +1,148 @@
+import {
+  Request, Response, WebError, Service, Controller, Application, Get, Post, Put, Delete, Status,
+  Body, Query, Header, Use, Auth, notFound,
+} from "orin-web";
+import { Todo, NewTodo, Priority, Normal } from "./model";
+
+export interface TodoRepository {
+  find(id: int): Option<Todo>;
+  all(): Todo[];
+}
+
+// A stateless repository: ids below 100 exist.
+@Service("TodoRepository")
+export class SeedRepository implements TodoRepository {
+  constructor(private owner: string) {}
+  static create(owner: string): SeedRepository {
+    return new SeedRepository(owner);
+  }
+  find(id: int): Option<Todo> {
+    if (id < 1 || id > 99) {
+      return None;
+    }
+    return Some(Todo {
+      id: id,
+      title: this.owner + " todo " + id.toString(),
+      done: false,
+      priority: Normal,
+      tags: ["seed"],
+      note: None,
+    });
+  }
+  all(): Todo[] {
+    return [this.find(1).unwrap(), this.find(2).unwrap()];
+  }
+}
+
+@Service
+export class TodoService {
+  constructor(private repo: TodoRepository) {}
+  static create(repo: TodoRepository): TodoService {
+    return new TodoService(repo);
+  }
+  get(id: int): Result<Todo, WebError> {
+    const t = this.repo.find(id);
+    if (t.isNone()) {
+      return Err(notFound("no todo " + id.toString()));
+    }
+    return Ok(t.unwrap());
+  }
+  list(page: Option<int>, size: Option<int>): Todo[] {
+    const all = this.repo.all();
+    const n = size.unwrapOr(all.length.toInt()).toUsize();
+    const start = page.unwrapOr(0).toUsize() * n;
+    let out: Todo[] = [];
+    let i = start;
+    while (i < all.length && i < start + n) {
+      out.push(all[i]);
+      i += 1;
+    }
+    return out;
+  }
+  make(n: NewTodo): Todo {
+    return Todo {
+      id: 100,
+      title: n.title,
+      done: false,
+      priority: n.priority,
+      tags: n.tags,
+      note: n.note,
+    };
+  }
+}
+
+@Controller("/todos")
+@Use("tag")
+export class TodoController {
+  constructor(private todos: TodoService) {}
+  static create(todos: TodoService): TodoController {
+    return new TodoController(todos);
+  }
+
+  @Get("/")
+  @Query("page, size=pageSize")
+  list(page: Option<int>, size: Option<int>): Todo[] {
+    return this.todos.list(page, size);
+  }
+
+  @Get("/:id")
+  find(id: int): Result<Todo, WebError> {
+    return this.todos.get(id);
+  }
+
+  @Get("/:id/title")
+  title(id: int): Result<Option<string>, WebError> {
+    return Ok(Some(this.todos.get(id)?.title));
+  }
+
+  @Post("/")
+  @Body
+  @Status(201)
+  add(todo: NewTodo): Todo {
+    return this.todos.make(todo);
+  }
+
+  @Put("/:id")
+  @Body("todo")
+  replace(id: int, todo: NewTodo): Result<Todo, WebError> {
+    this.todos.get(id)?;
+    return Ok(this.todos.make(todo));
+  }
+
+  @Delete("/:id")
+  remove(id: int): Result<void, WebError> {
+    this.todos.get(id)?;
+    return Ok();
+  }
+
+  @Get("/agent")
+  @Header("agent=User-Agent")
+  agent(agent: Option<string>): string {
+    return agent.unwrapOr("none");
+  }
+
+  @Get("/flag/:on")
+  flag(on: bool): bool {
+    return on;
+  }
+
+  @Get("/tags")
+  @Query("tag")
+  tags(tag: string[]): string[] {
+    return tag;
+  }
+
+  @Get("/raw")
+  raw(): Response {
+    return Response.text(200, "raw");
+  }
+
+  @Get("/secret")
+  @Auth
+  secret(req: Request): string {
+    return "secret for " + req.attr("principal").unwrapOr("?");
+  }
+}
+
+@Application
+export type TodoApp = {};

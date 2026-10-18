@@ -1,0 +1,4 @@
+[package]
+name = "orin-web"
+version = "0.1.0"
+entry = "src/module.or"
