@@ -1,0 +1,2 @@
+# Orin lock v1: name|kind|source|selector|commit
+orin-web|path|../..||local

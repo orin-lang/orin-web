@@ -1,0 +1,20 @@
+import { assertEq, assertEqString, assert } from "std:test";
+import { emptyStore, addTodo, toggleTodo, removeTodo, findTodo } from "../src/store";
+
+@Test
+function addToggleRemove(): void {
+  let s = emptyStore();
+  s = addTodo(s, "milk");
+  s = addTodo(s, "eggs");
+  assertEq(s.todos.length.toInt(), 2, "two todos");
+  assertEq(s.todos[1].id, 2, "ids count up");
+  s = toggleTodo(s, 1);
+  assert(findTodo(s, 1).unwrap().done, "toggled");
+  s = toggleTodo(s, 1);
+  assert(!findTodo(s, 1).unwrap().done, "toggled back");
+  s = removeTodo(s, 1);
+  assert(findTodo(s, 1).isNone(), "removed");
+  s = addTodo(s, "tea");
+  assertEqString(s.todos[1].title, "tea", "new todo");
+  assertEq(s.todos[1].id, 3, "ids are never reused");
+}

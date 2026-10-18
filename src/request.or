@@ -8,7 +8,8 @@ import {
 } from "std:url";
 import { JsonValue, parseDocument, defaultReadOptions, jsonParseErrorMessage } from "std:json";
 import { isValid } from "std:utf8";
-import { WebError, badRequest, notFound } from "./error";
+import { DecodeError, decodeErrorMessage } from "std:json/decode";
+import { WebError, badRequest, notFound, unprocessable } from "./error";
 
 // The parts of a request, for `Request.tryNew`. `target` is the request-target as it came on the wire: an origin-form
 // path with an optional query ("/users/7?verbose=1"), or "*".
@@ -345,4 +346,22 @@ export class Request {
       this.reqAttrs,
     );
   }
+}
+
+// decodeBody(req, decode): Result<T, WebError> -- the JSON body decoded into a `T` with a decoder written against
+// `std:json/decode`. A body that is not JSON is a 400 error; a document that does not have the expected shape is a 422 error
+// whose text names the path and the expectation (never the input value).
+//
+//   function decodeNewTodo(v: JsonValue): Result<NewTodo, DecodeError> { .. }
+//   const body = decodeBody(req, decodeNewTodo)?;
+export function decodeBody<T>(
+  req: Request,
+  decode: (v: JsonValue) => Result<T, DecodeError>,
+): Result<T, WebError> {
+  const doc = req.bodyJson()?;
+  const r = decode(doc);
+  if (r.isErr()) {
+    return Err(unprocessable(decodeErrorMessage(r.unwrapErr())));
+  }
+  return Ok(r.unwrap());
 }

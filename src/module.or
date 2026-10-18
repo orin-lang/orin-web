@@ -8,7 +8,7 @@ export {
 } from "./error";
 
 // Requests and responses.
-export { Request, RequestParts } from "./request";
+export { Request, RequestParts, decodeBody } from "./request";
 export { Response, Body, FixedBody, StreamBody } from "./response";
 export {
   jsonMember, jsonObject, jsonArray, jsonString, jsonInt, jsonBool, jsonNull,

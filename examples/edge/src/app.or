@@ -1,0 +1,70 @@
+// The edge application: pure request handling, no sockets. This is what runs on wasm32-orbit, where `std:net` does not exist:
+// a `Router` is just a function from `Request` to `Response`, so any host that can deliver a request can drive it.
+import { methodFromToken, emptyHeaders } from "std:http";
+import { fromString } from "std:bytes";
+import { JsonValue, defaultLimits } from "std:json";
+import {
+  DecodeError, RejectUnknown, decodeRoot, checkFields, requiredField, decodeInt,
+} from "std:json/decode";
+import {
+  Router, Request, RequestParts, Response, WebError, jsonObject, jsonMember, jsonString, jsonInt,
+  decodeBody, cors, defaultCors, recover, defaultErrorResponse,
+} from "orin-web";
+
+type Pair = { a: int; b: int; };
+
+function decodePair(v: JsonValue): Result<Pair, DecodeError> {
+  const root = decodeRoot(v, defaultLimits())?;
+  checkFields(root, ["a", "b"], RejectUnknown)?;
+  const a = decodeInt(requiredField(root, "a")?, -1000000, 1000000)?;
+  const b = decodeInt(requiredField(root, "b")?, -1000000, 1000000)?;
+  return Ok(Pair { a: a, b: b });
+}
+
+export function buildApp(): Router {
+  let app = new Router();
+  app.use(cors(defaultCors()));
+  app.use(recover(defaultErrorResponse));
+  app.get(
+    "/hello/:name",
+    (req: Request): Result<Response, WebError> => {
+      return Response.json(
+        200,
+        jsonObject([jsonMember("hello", jsonString(req.param("name").unwrapOr("world")))]),
+      );
+    },
+  );
+  app.post(
+    "/sum",
+    (req: Request): Result<Response, WebError> => {
+      const p = decodeBody(req, decodePair)?;
+      return Response.json(200, jsonObject([jsonMember("sum", jsonInt(p.a + p.b))]));
+    },
+  );
+  return app;
+}
+
+// handleLine(app, line): string -- one request per line: `METHOD /target [body]`; the answer is `STATUS body`. Lines that do
+// not parse are answered `400`. The line protocol stands in for whatever delivers requests on the host.
+export function handleLine(app: Router, line: string): string {
+  const parts = line.split(" ");
+  if (parts.length < 2) {
+    return "400 expected: METHOD /target [body]";
+  }
+  const method = methodFromToken(parts[0]);
+  if (method.isNone()) {
+    return "400 unknown method";
+  }
+  const body = parts.length > 2 ? parts.slice(2, parts.length).join(" ") : "";
+  const built = Request.tryNew(RequestParts {
+    method: method.unwrap(),
+    target: parts[1],
+    headers: emptyHeaders(),
+    body: fromString(body),
+  });
+  if (built.isErr()) {
+    return "400 bad request target";
+  }
+  const res = app.handle(built.unwrap());
+  return res.status().toString() + " " + res.bodyText();
+}

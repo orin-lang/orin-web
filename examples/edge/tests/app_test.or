@@ -1,0 +1,22 @@
+import { assertEqString } from "std:test";
+import { handleLine, buildApp } from "../src/app";
+
+@Test
+function linesAreAnswered(): void {
+  const app = buildApp();
+  assertEqString(handleLine(app, "GET /hello/ada"), "200 {\"hello\":\"ada\"}", "hello");
+  assertEqString(handleLine(app, "POST /sum {\"a\":40,\"b\":2}"), "200 {\"sum\":42}", "sum");
+  assertEqString(
+    handleLine(app, "POST /sum {\"a\":1,\"b\":\"x\"}").substring(0, 3),
+    "422",
+    "wrong type",
+  );
+  assertEqString(handleLine(app, "POST /sum nope").substring(0, 3), "400", "not JSON");
+  assertEqString(
+    handleLine(app, "GET /nope"),
+    "404 {\"error\":\"Not Found\",\"status\":404}",
+    "unknown path",
+  );
+  assertEqString(handleLine(app, "G(T /x"), "400 unknown method", "method");
+  assertEqString(handleLine(app, "GET"), "400 expected: METHOD /target [body]", "short line");
+}
