@@ -38,3 +38,6 @@ export function toggleTodo(s: Store, id: int): Store {
 export function removeTodo(s: Store, id: int): Store {
   return Store { todos: s.todos.filter(t => t.id != id), next: s.next };
 }
+
+// The body of a request that creates a todo.
+export type NewTodo = { title: string; };

@@ -1,0 +1,700 @@
+// `@Controller("/prefix")`: a class whose methods are routes.
+//
+//   @Controller("/todos")
+//   @Use("log")
+//   export class TodoController {
+//     constructor(private todos: TodoService) {}
+//     static create(todos: TodoService): TodoController { return new TodoController(todos); }
+//
+//     @Get("/:id")                                     // GET /todos/7, `id` is the path parameter `:id`
+//     find(id: int): Result<Todo, WebError> { .. }
+//
+//     @Post("/")
+//     @Body
+//     @Status(201)
+//     add(todo: NewTodo): Result<Todo, WebError> { .. }
+//   }
+//
+// The processor reads the class, the route and binding annotations of its methods, and the types of the parameters and the results,
+// and generates in the companion module (names are fixed, see docs/design.md "The generated code"):
+//
+//   export type ControllerDeps = { <one field per dependency of the controllers> };
+//   export function registerControllers(router: Router, deps: ControllerDeps, mws: Middlewares): Router
+//   export function registerControllersFrom(router: Router, svc: Services, mws: Middlewares): Router   // when every dependency is a service of this module
+//
+// plus private handler functions, one per route, and JSON encoders and decoders for the record types that are returned or received.
+// Every problem the processor can see is a compile-time error at the class: an unbound parameter, an unsupported parameter or result
+// type, two routes on one method, a missing `create`.
+import {
+  Input, Output, MDecl, MStmt, MExpr, MFieldInit, MType, MParam, MDeclView, MMethodView,
+  MAnnotation, MDiagnostic, MImport, MRef, MNamed, MOption, MArray, MResult, fresh, named, resultOf,
+  fn, param, recordType, ret, retVoid, exprS, constS, letS, assign, name, call, callExpr, method,
+  dot, str, intLit, record, initField, tryOp, exportDecl, output, withImports, withDiagnostics,
+  diagError, importFrom,
+} from "std:meta";
+import {
+  WEB_MODULE, typeKey, plainName, lowerCamel, annotationString, annotationInt, hasAnnotation,
+  findMethod, isLocalOpaque, splitList, uniqueSorted, upper,
+} from "./metautil";
+import { Ctx, Gen, newGen, encoderFor, decoderFor, importsOf } from "./gen_codec";
+
+@Annotation(class)
+export type Controller = { prefix: string; };
+
+// ---- routes -------------------------------------------------------------------------------------------------------------
+
+export type RouteSpec = { verb: string; path: string; };
+
+// routeOf(m) -- the route of a method: None without a route annotation. Err when it has several.
+export function routeOf(m: MMethodView): Result<Option<RouteSpec>, string> {
+  let found: RouteSpec[] = [];
+  for (const a of m.annotations) {
+    for (const v of ["Get", "Post", "Put", "Patch", "Delete"]) {
+      if (a.name == v) {
+        const p = annotationString(m.annotations, v, "path");
+        found.push(RouteSpec { verb: upper(v), path: p.isSome() ? p.unwrap() : "/" });
+      }
+    }
+  }
+  if (found.length > 1) {
+    return Err("has " + found.length.toString() + " route annotations; a method is one route");
+  }
+  if (found.length == 0) {
+    return Ok(None);
+  }
+  return Ok(Some(found[0]));
+}
+
+// The names of the path parameters of a route pattern: "/orgs/:org/files/*rest" is ["org", "rest"].
+export function pathParams(pattern: string): string[] {
+  let out: string[] = [];
+  for (const seg of pattern.split("/")) {
+    if (seg.length > 1 && (seg.startsWith(":") || seg.startsWith("*"))) {
+      out.push(seg.substring(1, seg.length));
+    }
+  }
+  return out;
+}
+
+// ---- parameter binding --------------------------------------------------------------------------------------------------
+
+// kind: "req", "path", "query", "header" or "body"; wire: the name on the wire.
+export type Binding = { p: MParam; kind: string; wire: string; };
+
+type Spec = { param: string; wire: string; };
+
+function specs(text: string): Spec[] {
+  let out: Spec[] = [];
+  for (const e of splitList(text)) {
+    const eq = e.indexOf("=");
+    if (eq.isSome()) {
+      out.push(Spec {
+        param: e.substring(0, eq.unwrap()).trim(),
+        wire: e.substring(eq.unwrap() + 1, e.length).trim(),
+      });
+    } else {
+      out.push(Spec { param: e, wire: e });
+    }
+  }
+  return out;
+}
+
+function specFor(list: Spec[], paramName: string): Option<Spec> {
+  for (const s of list) {
+    if (s.param == paramName) {
+      return Some(s);
+    }
+  }
+  return None;
+}
+
+export type Bound = { bindings: Binding[]; problems: string[]; };
+
+// bindMethod(m, route) -- decides, for every parameter of the method, where its value comes from.
+export function bindMethod(m: MMethodView, route: RouteSpec): Bound {
+  const pathSpec = specs(annotationString(m.annotations, "Path", "bindings").unwrapOr(""));
+  const querySpec = specs(annotationString(m.annotations, "Query", "bindings").unwrapOr(""));
+  const headerSpec = specs(annotationString(m.annotations, "Header", "bindings").unwrapOr(""));
+  const bodyNamed = annotationString(m.annotations, "Body", "parameter");
+  const hasBody = hasAnnotation(m.annotations, "Body");
+  const inPattern = pathParams(route.path);
+  let problems: string[] = [];
+  let all: Spec[] = [];
+  for (const s of pathSpec) {
+    all.push(s);
+  }
+  for (const s of querySpec) {
+    all.push(s);
+  }
+  for (const s of headerSpec) {
+    all.push(s);
+  }
+  for (const s of all) {
+    let exists = false;
+    for (const p of m.params) {
+      if (p.name == s.param) {
+        exists = true;
+      }
+    }
+    if (!exists) {
+      problems.push("the binding names `" + s.param + "`, which is not a parameter of " + m.name);
+    }
+  }
+  for (const s of pathSpec) {
+    if (!inPattern.includes(s.wire)) {
+      problems.push(
+        "@Path binds `" + s.param + "` to `" + s.wire + "`, but the route " + route.path
+            + " has no path parameter of that name",
+      );
+    }
+  }
+  if (bodyNamed.isSome()) {
+    let exists = false;
+    for (const p of m.params) {
+      if (p.name == bodyNamed.unwrap()) {
+        exists = true;
+      }
+    }
+    if (!exists) {
+      problems.push(
+        "@Body names `" + bodyNamed.unwrap() + "`, which is not a parameter of " + m.name,
+      );
+    }
+  }
+  let bindings: Binding[] = [];
+  let unbound: MParam[] = [];
+  for (const p of m.params) {
+    const ps = specFor(pathSpec, p.name);
+    const qs = specFor(querySpec, p.name);
+    const hs = specFor(headerSpec, p.name);
+    let hits = 0;
+    if (ps.isSome()) {
+      hits += 1;
+    }
+    if (qs.isSome()) {
+      hits += 1;
+    }
+    if (hs.isSome()) {
+      hits += 1;
+    }
+    if (bodyNamed.isSome() && bodyNamed.unwrap() == p.name) {
+      hits += 1;
+    }
+    if (hits > 1) {
+      problems.push("parameter `" + p.name + "` of " + m.name + " is bound twice");
+    } else if (plainName(p.ty) == "Request") {
+      bindings.push(Binding { p: p, kind: "req", wire: "" });
+    } else if (ps.isSome()) {
+      bindings.push(Binding { p: p, kind: "path", wire: ps.unwrap().wire });
+    } else if (qs.isSome()) {
+      bindings.push(Binding { p: p, kind: "query", wire: qs.unwrap().wire });
+    } else if (hs.isSome()) {
+      bindings.push(Binding { p: p, kind: "header", wire: hs.unwrap().wire });
+    } else if (bodyNamed.isSome() && bodyNamed.unwrap() == p.name) {
+      bindings.push(Binding { p: p, kind: "body", wire: "" });
+    } else if (inPattern.includes(p.name)) {
+      bindings.push(Binding { p: p, kind: "path", wire: p.name });
+    } else {
+      unbound.push(p);
+    }
+  }
+  if (hasBody && bodyNamed.isNone()) {
+    if (unbound.length == 1) {
+      bindings.push(Binding { p: unbound[0], kind: "body", wire: "" });
+      unbound = [];
+    } else {
+      problems.push(
+        "@Body needs exactly one parameter that is bound to nothing else (or name it: @Body(\"todo\")); "
+            + m.name + " has " + unbound.length.toString(),
+      );
+    }
+  }
+  for (const p of unbound) {
+    problems.push(
+      "parameter `" + p.name + "` of " + m.name
+          + " is not bound: name it in @Path, @Query or @Header, make it the @Body, take a Request, or give it the name of a path parameter of "
+          + route.path,
+    );
+  }
+  // restore the order of the parameters
+  let ordered: Binding[] = [];
+  for (const p of m.params) {
+    for (const b of bindings) {
+      if (b.p.name == p.name) {
+        ordered.push(b);
+      }
+    }
+  }
+  return Bound { bindings: ordered, problems: problems };
+}
+
+function capOf(s: string): string {
+  return s == "string" ? "String" : s == "int" ? "Int" : s == "bool" ? "Bool" : "";
+}
+
+// bindFunction(b) -- the runtime function that reads this binding, or "" when the type is not supported there.
+export function bindFunction(b: Binding): string {
+  const optional = match (b.p.ty) {
+    MOption(inner) => plainName(inner),
+    _ => "",
+  };
+  const base = plainName(b.p.ty);
+  const elemName = match (b.p.ty) {
+    MArray(e) => plainName(e),
+    _ => "",
+  };
+  if (b.kind == "path") {
+    return capOf(base).length > 0 ? "bindPath" + capOf(base) : "";
+  }
+  if (b.kind == "query") {
+    if (capOf(base).length > 0) {
+      return "bindQuery" + capOf(base);
+    }
+    if (capOf(optional).length > 0) {
+      return "bindQuery" + capOf(optional) + "Opt";
+    }
+    if (elemName == "string") {
+      return "bindQueryStrings";
+    }
+    if (elemName == "int") {
+      return "bindQueryInts";
+    }
+    return "";
+  }
+  if (b.kind == "header") {
+    if (base == "string") {
+      return "bindHeader";
+    }
+    if (capOf(base).length > 0) {
+      return "bindHeader" + capOf(base);
+    }
+    if (optional == "string") {
+      return "bindHeaderOpt";
+    }
+    if (capOf(optional).length > 0) {
+      return "bindHeader" + capOf(optional) + "Opt";
+    }
+    return "";
+  }
+  return "";
+}
+
+// ---- one route: the handler function --------------------------------------------------------------------------------------
+
+type Handler = { gen: Gen; fnName: string; ok: bool; };
+
+// The call of the controller method with the bound values.
+function callOf(m: MMethodView, args: MExpr[]): MExpr {
+  return method(name("c"), m.name, args);
+}
+
+// The success status: `@Status(n)`, else 200, or 204 for a method that returns nothing.
+function statusOf(m: MMethodView, nothing: bool): int {
+  const s = annotationInt(m.annotations, "Status", "code");
+  if (s.isSome()) {
+    return s.unwrap();
+  }
+  return nothing ? 204 : 200;
+}
+
+function isWebError(t: MType): bool {
+  return plainName(t) == "WebError";
+}
+
+// genHandler(g, ctx, cls, m, route) -- `function h(c: Cls, req: Request): Result<Response, WebError>` for one route method.
+function genHandler(g0: Gen, ctx: Ctx, cls: string, m: MMethodView, route: RouteSpec): Handler {
+  let g = g0;
+  const bound = bindMethod(m, route);
+  if (bound.problems.length > 0) {
+    let ps = g.problems;
+    for (const t of bound.problems) {
+      ps.push(diagError(m.ref, cls + "." + t));
+    }
+    return Handler { gen: Gen { ...g, problems: ps }, fnName: "", ok: false };
+  }
+  const fnName = fresh("h_" + cls + "_" + m.name, g.base + g.counter);
+  g = Gen { ...g, counter: g.counter + 1 };
+  const mctx = Ctx {
+    types: ctx.types,
+    modulePath: ctx.modulePath,
+    at: ctx.at,
+    where: cls + "." + m.name,
+  };
+  let body: MStmt[] = [];
+  let args: MExpr[] = [];
+  for (const b of bound.bindings) {
+    if (b.kind == "req") {
+      args.push(name("req"));
+    } else {
+      const local = fresh("a_" + b.p.name, g.base + g.counter);
+      g = Gen { ...g, counter: g.counter + 1 };
+      if (b.kind == "body") {
+        const d = decoderFor(g, mctx, b.p.ty);
+        g = d.gen;
+        if (d.fnName == "") {
+          return Handler { gen: g, fnName: "", ok: false };
+        }
+        g = useWebName(g, "decodeBodyWith");
+        body.push(constS(local, tryOp(call("decodeBodyWith", [name("req"), name(d.fnName)]))));
+      } else {
+        const f = bindFunction(b);
+        if (f == "") {
+          let ps = g.problems;
+          ps.push(
+            diagError(
+              m.ref,
+              cls + "." + m.name + ": parameter `" + b.p.name + "` has type " + typeKey(b.p.ty)
+                  + ", which cannot be read from a " + b.kind + " (supported: string, int, bool"
+                  + (b.kind == "path" ? "" : ", Option of those")
+                  + (b.kind == "query" ? ", string[], int[]" : "") + ")",
+            ),
+          );
+          return Handler { gen: Gen { ...g, problems: ps }, fnName: "", ok: false };
+        }
+        g = useWebName(g, f);
+        body.push(constS(local, tryOp(call(f, [name("req"), str(b.wire)]))));
+      }
+      args.push(name(local));
+    }
+  }
+  const invoked = callOf(m, args);
+  const ret_ = m.returns;
+  const shaped = genReturn(g, mctx, m, ret_, invoked, body);
+  if (!shaped.ok) {
+    return Handler { gen: shaped.gen, fnName: "", ok: false };
+  }
+  g = shaped.gen;
+  g = useWebName(g, "Request");
+  g = useWebName(g, "Response");
+  g = useWebName(g, "WebError");
+  const resultType = resultOf(named("Response"), named("WebError"));
+  let ds = g.decls;
+  ds.push(
+    fn(fnName, [param("c", named(cls)), param("req", named("Request"))], resultType, shaped.body),
+  );
+  return Handler { gen: Gen { ...g, decls: ds }, fnName: fnName, ok: true };
+}
+
+type Shaped = { gen: Gen; body: MStmt[]; ok: bool; };
+
+function useWebName(g: Gen, n: string): Gen {
+  let w = g.web;
+  w.push(n);
+  return Gen { ...g, web: w };
+}
+
+// The statements that call the method and turn its result into `Result<Response, WebError>`.
+function genReturn(
+  g0: Gen,
+  ctx: Ctx,
+  m: MMethodView,
+  t: MType,
+  invoked: MExpr,
+  before: MStmt[],
+): Shaped {
+  let g = g0;
+  let body = before;
+  const tn = plainName(t);
+  if (tn == "Response") {
+    g = useWebName(g, "respondResponse");
+    body.push(ret(call("respondResponse", [invoked])));
+    return Shaped { gen: g, body: body, ok: true };
+  }
+  if (tn == "void") {
+    g = useWebName(g, "respondUnit");
+    body.push(exprS(invoked));
+    body.push(ret(call("respondUnit", [intLit(statusOf(m, true))])));
+    return Shaped { gen: g, body: body, ok: true };
+  }
+  const inner = match (t) {
+    MResult(ok, e) => Some(ok),
+    _ => None,
+  };
+  const errType = match (t) {
+    MResult(ok, e) => e,
+    _ => named("WebError"),
+  };
+  if (inner.isSome()) {
+    if (!isWebError(errType)) {
+      let ps = g.problems;
+      ps.push(
+        diagError(
+          ctx.at,
+          ctx.where + ": the error type of the result must be WebError, not " + typeKey(errType),
+        ),
+      );
+      return Shaped { gen: Gen { ...g, problems: ps }, body: body, ok: false };
+    }
+    const okName = plainName(inner.unwrap());
+    if (okName == "Response") {
+      body.push(ret(invoked));
+      return Shaped { gen: g, body: body, ok: true };
+    }
+    if (okName == "void") {
+      g = useWebName(g, "respondResultUnit");
+      body.push(ret(call("respondResultUnit", [invoked, intLit(statusOf(m, true))])));
+      return Shaped { gen: g, body: body, ok: true };
+    }
+    const optional = match (inner.unwrap()) {
+      MOption(x) => Some(x),
+      _ => None,
+    };
+    if (optional.isSome()) {
+      const e = encoderFor(g, ctx, optional.unwrap());
+      g = useWebName(e.gen, "respondResultOption");
+      if (e.fnName == "") {
+        return Shaped { gen: g, body: body, ok: false };
+      }
+      body.push(
+        ret(call("respondResultOption", [intLit(statusOf(m, false)), invoked, name(e.fnName)])),
+      );
+      return Shaped { gen: g, body: body, ok: true };
+    }
+    const e = encoderFor(g, ctx, inner.unwrap());
+    g = useWebName(e.gen, "respondResult");
+    if (e.fnName == "") {
+      return Shaped { gen: g, body: body, ok: false };
+    }
+    body.push(ret(call("respondResult", [intLit(statusOf(m, false)), invoked, name(e.fnName)])));
+    return Shaped { gen: g, body: body, ok: true };
+  }
+  const optionalPlain = match (t) {
+    MOption(x) => Some(x),
+    _ => None,
+  };
+  if (optionalPlain.isSome()) {
+    const e = encoderFor(g, ctx, optionalPlain.unwrap());
+    g = useWebName(e.gen, "respondOption");
+    if (e.fnName == "") {
+      return Shaped { gen: g, body: body, ok: false };
+    }
+    body.push(ret(call("respondOption", [intLit(statusOf(m, false)), invoked, name(e.fnName)])));
+    return Shaped { gen: g, body: body, ok: true };
+  }
+  const e = encoderFor(g, ctx, t);
+  g = useWebName(e.gen, "respondValue");
+  if (e.fnName == "") {
+    return Shaped { gen: g, body: body, ok: false };
+  }
+  body.push(ret(call("respondValue", [intLit(statusOf(m, false)), invoked, name(e.fnName)])));
+  return Shaped { gen: g, body: body, ok: true };
+}
+
+// ---- the controllers of a module ----------------------------------------------------------------------------------------------
+
+// The field of `ControllerDeps` a dependency is stored under: the lowerCamelCase of a plain type name, else the parameter name.
+function depField(p: MParam): string {
+  const k = plainName(p.ty);
+  const primitive = k == "string" || k == "int" || k == "bool" || k == "float";
+  return k.length > 0 && !primitive ? lowerCamel(k) : p.name;
+}
+
+export type Plan = { decls: MDecl[]; imports: MImport[]; problems: MDiagnostic[]; };
+
+// planControllers(input) -- everything the processor generates, or the problems. Pure; the tests call it.
+export function planControllers(input: Input): Plan {
+  let g = newGen(input.freshBase);
+  let depFields: MParam[] = [];
+  let allLocal = true;
+  let anyLocal = false;
+  let stmts: MStmt[] = [letS("r", name("router"))];
+  let instances = 0;
+  for (const d of input.decls) {
+    const ctx = Ctx { types: input.types, modulePath: input.modulePath, at: d.ref, where: d.name };
+    const prefix = annotationString(d.annotations, "Controller", "prefix").unwrapOr("/");
+    const factory = findMethod(d, "create");
+    if (factory.isNone()) {
+      let ps = g.problems;
+      ps.push(
+        diagError(
+          d.ref,
+          "@Controller class " + d.name
+              + " needs a static factory `create(..)` whose parameters are its dependencies; generated code cannot call `new "
+              + d.name + "(..)`",
+        ),
+      );
+      g = Gen { ...g, problems: ps };
+    } else {
+      const f = factory.unwrap();
+      if (plainName(f.returns) != d.name) {
+        let ps = g.problems;
+        ps.push(
+          diagError(
+            d.ref,
+            d.name + ".create must return " + d.name + ", not " + typeKey(f.returns),
+          ),
+        );
+        g = Gen { ...g, problems: ps };
+      }
+      let ctorArgs: MExpr[] = [];
+      for (const p of f.params) {
+        const field = depField(p);
+        let have = false;
+        for (const x of depFields) {
+          if (x.name == field) {
+            have = true;
+            if (typeKey(x.ty) != typeKey(p.ty)) {
+              let ps = g.problems;
+              ps.push(
+                diagError(
+                  d.ref,
+                  "the dependency `" + field + "` of " + d.name + " has type " + typeKey(p.ty)
+                      + ", but another controller declares it as " + typeKey(x.ty),
+                ),
+              );
+              g = Gen { ...g, problems: ps };
+            }
+          }
+        }
+        if (!have) {
+          depFields.push(MParam { name: field, ty: p.ty });
+        }
+        const k = plainName(p.ty);
+        if (k.length > 0 && isLocalOpaque(input.types, input.modulePath, k)) {
+          anyLocal = true;
+        } else {
+          allLocal = false;
+        }
+        ctorArgs.push(dot(name("deps"), field));
+      }
+      // handlers
+      let routes: MStmt[] = [];
+      const inst = fresh("c_" + d.name, g.base + g.counter);
+      const grp = fresh("g_" + d.name, g.base + g.counter + 1);
+      g = Gen { ...g, counter: g.counter + 2 };
+      instances += 1;
+      const classUse = classMiddleware(d);
+      for (const m of d.methods) {
+        const route = routeOf(m);
+        if (route.isErr()) {
+          let ps = g.problems;
+          ps.push(diagError(m.ref, d.name + "." + m.name + " " + route.unwrapErr()));
+          g = Gen { ...g, problems: ps };
+        } else if (route.unwrap().isSome()) {
+          const rt = route.unwrap().unwrap();
+          const h = genHandler(g, ctx, d.name, m, rt);
+          g = h.gen;
+          if (h.ok) {
+            g = useWebName(g, "wireController");
+            g = useWebName(g, "addRoute");
+            let handler: MExpr = call("wireController", [name(inst), name(h.fnName)]);
+            const use = methodMiddleware(m);
+            if (use.length > 0) {
+              g = useWebName(g, "useAll");
+              handler = call(
+                "useAll",
+                [name("mws"), str(use), str(d.name + "." + m.name), handler],
+              );
+            }
+            routes.push(
+              assign(name(grp), call("addRoute", [name(grp), str(rt.verb), str(rt.path), handler])),
+            );
+          }
+        }
+      }
+      g = useWebName(g, "newRouter");
+      g = useWebName(g, "mountGroup");
+      stmts.push(constS(inst, method(name(d.name), "create", ctorArgs)));
+      stmts.push(letS(grp, call("newRouter", [])));
+      if (classUse.length > 0) {
+        g = useWebName(g, "useGroup");
+        stmts.push(
+          assign(name(grp), call("useGroup", [name(grp), name("mws"), str(classUse), str(d.name)])),
+        );
+      }
+      for (const r of routes) {
+        stmts.push(r);
+      }
+      stmts.push(
+        assign(
+          name("r"),
+          call("mountGroup", [name("r"), str(prefix.length == 0 ? "/" : prefix), name(grp)]),
+        ),
+      );
+    }
+  }
+  if (g.problems.length > 0) {
+    return Plan { decls: [], imports: [], problems: g.problems };
+  }
+  g = useWebName(g, "Router");
+  g = useWebName(g, "Middlewares");
+  stmts.push(ret(name("r")));
+  let decls: MDecl[] = g.decls;
+  decls.push(exportDecl(recordType("ControllerDeps", depFields), true));
+  decls.push(
+    exportDecl(
+      fn(
+        "registerControllers",
+        [
+          param("router", named("Router")),
+          param("deps", named("ControllerDeps")),
+          param("mws", named("Middlewares")),
+        ],
+        named("Router"),
+        stmts,
+      ),
+      true,
+    ),
+  );
+  if (anyLocal && allLocal) {
+    let inits: MFieldInit[] = [];
+    for (const f of depFields) {
+      inits.push(initField(f.name, dot(name("svc"), f.name)));
+    }
+    decls.push(
+      exportDecl(
+        fn(
+          "registerControllersFrom",
+          [
+            param("router", named("Router")),
+            param("svc", named("Services")),
+            param("mws", named("Middlewares")),
+          ],
+          named("Router"),
+          [
+            ret(
+              call(
+                "registerControllers",
+                [name("router"), record("ControllerDeps", inits), name("mws")],
+              ),
+            ),
+          ],
+        ),
+        true,
+      ),
+    );
+  }
+  return Plan { decls: decls, imports: importsOf(g, WEB_MODULE), problems: [] };
+}
+
+// The middleware names of a class or method: @Use("a, b") and @Auth (= "auth"), comma-separated; "" for none.
+function middlewareNames(annotations: MAnnotation[]): string {
+  let names: string[] = [];
+  const u = annotationString(annotations, "Use", "names");
+  if (u.isSome()) {
+    for (const n of splitList(u.unwrap())) {
+      names.push(n);
+    }
+  }
+  if (hasAnnotation(annotations, "Auth") && !names.includes("auth")) {
+    names.push("auth");
+  }
+  return names.join(",");
+}
+
+function classMiddleware(d: MDeclView): string {
+  return middlewareNames(d.annotations);
+}
+
+function methodMiddleware(m: MMethodView): string {
+  return middlewareNames(m.annotations);
+}
+
+@Processor(Controller)
+export function controllerProc(input: Input): Output {
+  const p = planControllers(input);
+  if (p.problems.length > 0) {
+    return withDiagnostics(output([]), p.problems);
+  }
+  return withImports(output(p.decls), p.imports);
+}

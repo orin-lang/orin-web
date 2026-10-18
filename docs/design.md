@@ -170,6 +170,203 @@ orin-ui view with the HTML renderer of orin-ui and returns the markup; a live vi
 source yields the patches (and `parseSseEvents` decodes them in a test). Both libraries therefore depend only on the standard
 library and can evolve separately.
 
+## The annotation model
+
+The functional API above is the engine. The annotation layer is a **front end that generates calls into it**: nothing at run time knows
+about annotations. `@Controller`, `@Service` and `@Application` are user annotations (ADR-0046) with pure processors in orin-web
+(`src/controller.or`, `src/service.or`, `src/application.or`); the compiler runs each over the modules that use it and compiles what
+they return into a companion module next to the source module (`beans.or` gets `beans.gen`, which `orin expand` prints).
+
+```
+ beans.or  --@Service-->   Services, ServicesDeps, buildServices
+           --@Controller-> ControllerDeps, registerControllers, registerControllersFrom, handler functions, JSON codecs
+           --@Application> buildApp
+                                |
+                     calls into Router, Middlewares, bind*, respond*, dec*/enc*   (src/wiring.or, bind.or, respond.or, codec.or)
+```
+
+The runtime helpers are ordinary, tested functions (`bindPathInt`, `respondResult`, `decodeBodyWith`, `wireController`, `useAll`...).
+The generated code is deliberately thin: it names which helper reads which parameter, which encoder writes which type, and in which
+order to create things. A reader can check it against the annotations by reading `orin expand`.
+
+### What each processor reads and checks
+
+**`@Service`** reads the services of a module and the parameters of their `create` factory. A dependency is resolved *by type*: a
+service is known under its class name or the interface it is registered as (`@Service("TodoRepository")`). A dependency that no
+service of the module provides becomes a field of `ServicesDeps`, named like the parameter, which the application supplies (a channel
+to an owner task, a configuration value, a service of another module). The processor orders the services topologically and reports,
+as compile errors at the class: a missing `create`, a `create` that does not return the class, two services for one type, a
+dependency on a class of this module that is not a service, two services declaring the same external name with different types, and a
+cycle, spelled out (`dependency cycle among services: A -> B -> C -> A`).
+
+**`@Controller`** reads the methods that carry a route annotation (`@Get`, `@Post`, `@Put`, `@Patch`, `@Delete`) and decides for
+every parameter where its value comes from:
+
+1. a parameter of type `Request` receives the request;
+2. a parameter listed in `@Path`, `@Query`, `@Header` is read from there (`name` or `name=wire name`, comma-separated);
+3. the parameter named by `@Body("p")`, or the only still-unbound parameter for a bare `@Body`, is the decoded JSON body;
+4. a parameter named like a path parameter of the route is that path parameter;
+5. anything else is a compile error at the method ("parameter `limit` of list is not bound").
+
+It also checks that `@Path` names a parameter of the pattern, that a method has one route, that results are `Response`, a value,
+`Option`, `void` or a `Result<_, WebError>` of those, and that every type that has to be read from or written as JSON is supported
+(`string`, `int`, `bool`, `JsonValue`, arrays, `Option`, records of those, unions of tags, aliases of those, and records may
+contain themselves). The error names the type and points at the method.
+
+The mapping of results: `Response` as is; `T` written as JSON with status 200 (`@Status` to change it); `Option<T>` is a 404 for `None`;
+`void` and `Result<void, _>` are 204; `Result<T, WebError>` passes the error on, which the router renders. A bad path or query value
+is a 400 that names the parameter, a body that is not JSON is a 400, and a body of the wrong shape is a 422 whose text names the path
+(`/tags/1: wrong type: expected string, found number`), never the value.
+
+**`@Application`** generates `buildApp(deps: ServicesDeps, mws: Middlewares): Router` for a module that holds both services and
+controllers: it builds the services, passes them to `registerControllersFrom`, and returns the router.
+
+### Dependency injection without a container at run time
+
+The "container" is the straight-line code in `buildServices`: each service is created once, after the services it needs, and handed
+down by plain function arguments. The services live in a record (`Services`) so that a controller registration can pick them by
+field. There is no lookup by name or type at run time, no reflection, and no global state. Singleton semantics are Orin's: a service
+is a value, so what a controller holds is a copy of it. A service that must share state with others holds a channel end to an owner task
+(`examples/todo-api`: `OwnerTodoRepository` holds a `Sender<Command>`), the same pattern as in the functional API.
+
+### The generated code for one example
+
+`tests/annotated` and `examples/todo-api` use this in full; this is a small module and what `orin expand` prints for it (hygienic
+names `__gN_...` are the compiler's; imports are abbreviated):
+
+```ts
+// beans.or
+@Service
+export class TodoService {
+  constructor(private prefix: string) {}
+  static create(prefix: string): TodoService { return new TodoService(prefix); }
+  find(id: int): Result<Todo, WebError> { .. }
+}
+
+@Controller("/todos")
+export class TodoController {
+  constructor(private todos: TodoService) {}
+  static create(todos: TodoService): TodoController { return new TodoController(todos); }
+
+  @Get("/:id")
+  find(id: int): Result<Todo, WebError> { return this.todos.find(id); }
+}
+
+@Application
+export type App = {};
+```
+
+```ts
+// companion module ./beans.gen
+
+import { Router, Middlewares, newRouter, Request, Response, WebError, addRoute, bindPathInt, jsonInt, jsonMember, jsonObject,
+         jsonString, mountGroup, respondResult, wireController } from "orin-web";
+import { JsonValue } from "std:json";
+import { Todo } from "./model";
+
+// generated for `@Application` on `App`
+export function buildApp(deps: ServicesDeps, mws: Middlewares): Router {
+  const services = buildServices(deps);
+  return registerControllersFrom(newRouter(), services, mws);
+}
+
+// generated for `@Controller` on `TodoController`
+function __g20004_enc_eTodo(v: Todo): JsonValue {
+  return jsonObject([jsonMember("id", jsonInt(v.id)), jsonMember("title", jsonString(v.title))]);
+}
+
+function __g20002_h_TodoController_find(c: TodoController, req: Request): Result<Response, WebError> {
+  const __g20003_a_id = bindPathInt(req, "id")?;
+  return respondResult(200, c.find(__g20003_a_id), __g20004_enc_eTodo);
+}
+
+export type ControllerDeps = { todoService: TodoService; };
+
+export function registerControllers(router: Router, deps: ControllerDeps, mws: Middlewares): Router {
+  let r = router;
+  const __g20000_c_TodoController = TodoController.create(deps.todoService);
+  let __g20001_g_TodoController = newRouter();
+  __g20001_g_TodoController = addRoute(__g20001_g_TodoController, "GET", "/:id",
+    wireController(__g20000_c_TodoController, __g20002_h_TodoController_find));
+  r = mountGroup(r, "/todos", __g20001_g_TodoController);
+  return r;
+}
+
+export function registerControllersFrom(router: Router, svc: Services, mws: Middlewares): Router {
+  return registerControllers(router, ControllerDeps { todoService: svc.todoService }, mws);
+}
+
+// generated for `@Service` on `TodoService`
+export type Services = { todoService: TodoService; };
+export type ServicesDeps = { prefix: string; };
+
+export function buildServices(deps: ServicesDeps): Services {
+  const __g30000_todoService = TodoService.create(deps.prefix);
+  return Services { todoService: __g30000_todoService };
+}
+```
+
+and the use:
+
+```ts
+import { buildApp, ServicesDeps } from "./beans.gen";
+const app = buildApp(ServicesDeps { prefix: "first" }, newMiddlewares());     // a Router
+app.handle(request);                  // or serve(net, app, config, ready), or new TestClient(app)
+```
+
+### Layouts: one module, or several
+
+A companion is generated per source module, and a module that uses processor annotations cannot import the companion of another
+module (ADR-0046: one round of expansion, E0520/E0521). So there are two layouts.
+
+* **One module** holds the services and the controllers, with `@Application`: `buildApp` does everything.
+* **Several modules** (`examples/todo-api`: `repository.or`, `service.or`, `controller.or`): each companion builds its own part, and a
+  small module *without annotations* connects them in dependency order (`wiring.or`):
+
+  ```ts
+  const repos = repositories.buildServices(repositories.ServicesDeps { commands: commands });
+  const svcs = services.buildServices(services.ServicesDeps { repo: repos.todoRepository });
+  let app = controllers.registerControllers(newRouter(), controllers.ControllerDeps { todoService: svcs.todoService }, mws);
+  ```
+
+  Every line is checked by the compiler, so a forgotten or mistyped dependency does not compile, but the lines are written by hand.
+
+### Middleware
+
+`@Use("name, other")` and `@Auth` (= `@Use("auth")`) name middleware, because annotation arguments are constants and a middleware is a
+function value. The names are bound at start-up in a `Middlewares` registry (`newMiddlewares().with("auth", bearerToken(..))`)
+that is passed to the generated registration. On a controller, the middleware wrap every route of the controller (a group router
+with `use`); on a method, that route only (`withMiddleware`). An unknown name stops the program at start-up with the controller,
+method and name, like a malformed route pattern. Global middleware (`logger`, `cors`) are added to the router with `Router.use`.
+
+### Why binding is declared on the method
+
+Orin annotations can target declarations, methods and fields, not parameters, so `@Path("id")` cannot sit next to the parameter it
+binds. The method carries the bindings by parameter name instead (`@Query("page, size=pageSize")`), and the common cases need no
+annotation at all (path parameters by name). The cost is that a rename must change two places; the processor reports a binding that
+names no parameter, so a stale annotation does not compile.
+
+### Why `static create`
+
+Generated code cannot instantiate a class: `std:meta` has no `new` expression, and a record literal of a class is refused outside its
+body. So each bean has a static factory whose parameters are its dependencies, forwarding to the constructor. The processor reads
+the factory, not the constructor, because it is the only code the generated container can call. See `docs/compiler-issues.md` for the
+proposal that removes this line.
+
+### Cost
+
+Each processor is built into a helper executable by the compiler. On `tests/annotated` (three processors, one module) the first
+`orin check` takes about 13.5 s and later ones 0.8 s, because the helpers and their outputs are cached under `.orin/processors`; an edit of
+the annotated module re-runs the processors but reuses the helpers. The generated code is ordinary code and adds nothing at run time
+beyond the helper calls it makes.
+
+### Testing generated code
+
+`orin test` cannot expand companion modules (docs/annotation-processors.md, "Limits"), so there are three kinds of tests:
+the processors as pure functions (`tests/processor_test.or`: an `Input` in, declarations and diagnostics out), the runtime helpers
+(`tests/binding_test.or`), and programs that use the generated code and trap on failure (`tests/annotated`, `examples/todo-api
+selftest`, run by `tools/ci.sh`), plus `tests/compile-fail`, which compiles broken modules and checks the error text.
+
 ## WebAssembly (`wasm32-orbit`)
 
 Checked against `orin 0.x` built from the repository at the time of writing.
@@ -177,6 +374,7 @@ Checked against `orin 0.x` built from the repository at the time of writing.
 | | Status |
 |---|---|
 | `Router`, `Request`, `Response`, middleware, JSON builders, assets, SSE encoding, `TestClient` | builds and runs (`examples/edge`, 290 KB module, run under `tools/wasm_run.mjs`) |
+| the annotation layer (generated container, routes, bindings, codecs) | builds and runs: `tests/annotated` passes all its checks as a `wasm32-orbit` module (processors run at compile time, on the host) |
 | `serve` and anything on `std:net` | **not available**: the build fails with E0523 naming `Stream.Write` and the call path from `main` |
 | a package that imports orin-web but does not call `serve` | builds: unused code is pruned, so the `std:net` imports in `server.or` cost nothing |
 | tasks and channels (`Response.sse` fed by a producer task, the owner-task pattern) | run one task at a time to completion; a handler that waits on a task which is itself waiting on the first (ping-pong over bounded channels) ends the module with `wasm32-orbit: deadlock` |
@@ -195,7 +393,7 @@ a host-provided network or request capability that does not exist in the target 
 | `src/module.or` | the public face (explicit export list) |
 | `src/error.or` | `WebError`, kinds, constructors, `webErrorStatus`, `webErrorMessage` |
 | `src/request.or` | `Request`, `RequestParts`, `decodeBody` |
-| `src/response.or` | `Response`, `Body` |
+| `src/response.or` | `Response`, `ResponseBody` |
 | `src/sse.or` | `SseEvent`, encoding and parsing |
 | `src/jsonbuild.or` | constructors for `std:json` values |
 | `src/router.or` | `Router`, `Handler`, `Middleware`, pattern parsing and matching, `chain`, `withMiddleware` |
@@ -203,6 +401,10 @@ a host-provided network or request capability that does not exist in the target 
 | `src/assets.or` | `Asset`, `assetsHandler`, `staticResponse`, `contentTypeFor` |
 | `src/testing.or` | `TestClient`, `testRequest`, `readEvents`, assertions |
 | `src/server.or` | `serve`, `ServerConfig`, `ServerHandle` |
+| `src/annotations.or` | `@Get @Post @Put @Patch @Delete @Status @Path @Query @Header @Body @Use @Auth` (metadata, read by the controller processor) |
+| `src/service.or`, `src/controller.or`, `src/application.or` | `@Service`, `@Controller`, `@Application` with their processors |
+| `src/gen_codec.or`, `src/metautil.or` | processor side: encoder and decoder generation, helpers (compile-time only) |
+| `src/bind.or`, `src/respond.or`, `src/codec.or`, `src/wiring.or` | runtime side: what the generated code calls |
 
 ## Possible next steps
 

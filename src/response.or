@@ -9,15 +9,15 @@ import { JsonValue, writeDocument, defaultLimits, jsonWriteErrorMessage } from "
 import { WebError, internalError } from "./error";
 import { SseEvent, sseBytes } from "./sse";
 
-export type Body = FixedBody(Bytes) | StreamBody(() => Option<Bytes>);
+export type ResponseBody = FixedBody(Bytes) | StreamBody(() => Option<Bytes>);
 
 export class Response {
   private resStatus: int;
   private resHeaders: Headers;
-  private resBody: Body;
+  private resBody: ResponseBody;
 
   // new Response(status, headers, body) -- a status outside 100..599 is stored as 500.
-  constructor(status: int, headers: Headers, body: Body) {
+  constructor(status: int, headers: Headers, body: ResponseBody) {
     this.resStatus = status >= 100 && status <= 599 ? status : 500;
     this.resHeaders = headers;
     this.resBody = body;
@@ -112,8 +112,8 @@ export class Response {
     };
   }
 
-  // body(): Body -- the body.
-  body(): Body {
+  // body(): ResponseBody -- the body.
+  body(): ResponseBody {
     return this.resBody;
   }
 

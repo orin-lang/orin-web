@@ -1,0 +1,58 @@
+// The repository: how the rest of the application reaches the todos. `TodoRepository` is the interface the service depends on;
+// `OwnerTodoRepository` implements it over the owner task of state.or (the one task that holds the list), so every call is one message
+// to the owner and one reply. A `@Service` is created by the generated `buildServices`, which injects `commands` from the application.
+import { Sender } from "std:task";
+import { Service } from "orin-web";
+import { Todo } from "./store";
+import {
+  Command, Reply, Listed, One, Absent, OpList, OpAdd, OpToggle, OpRemove, ask,
+} from "./state";
+
+export interface TodoRepository {
+  list(): Todo[];
+  add(title: string): Option<Todo>;
+  toggle(id: int): Option<Todo>;
+  remove(id: int): Option<Todo>;
+}
+
+@Service("TodoRepository")
+export class OwnerTodoRepository implements TodoRepository {
+  constructor(private commands: Sender<Command>) {}
+
+  static create(commands: Sender<Command>): OwnerTodoRepository {
+    return new OwnerTodoRepository(commands);
+  }
+
+  list(): Todo[] {
+    const r = ask(this.commands, OpList, 0, "");
+    if (r.isSome()) {
+      return match (r.unwrap()) {
+        Listed(ts) => ts,
+        _ => [],
+      };
+    }
+    return [];
+  }
+
+  add(title: string): Option<Todo> {
+    return one(ask(this.commands, OpAdd, 0, title));
+  }
+
+  toggle(id: int): Option<Todo> {
+    return one(ask(this.commands, OpToggle, id, ""));
+  }
+
+  remove(id: int): Option<Todo> {
+    return one(ask(this.commands, OpRemove, id, ""));
+  }
+}
+
+function one(r: Option<Reply>): Option<Todo> {
+  if (r.isNone()) {
+    return None;
+  }
+  return match (r.unwrap()) {
+    One(t) => Some(t),
+    _ => None,
+  };
+}

@@ -1,0 +1,573 @@
+// The annotation processors as functions: they are pure, so they are tested by building an `Input` (what the compiler would
+// snapshot) and looking at the `Output`. The generated code compiling and routing correctly is tested end to end by
+// tests/annotated (see tools/ci.sh), because `orin test` does not expand companion modules.
+import { assert, assertEq, assertEqString } from "std:test";
+import {
+  Input, Output, MDeclView, MDeclKind, MKClass, MMethodView, MAnnotation, MArg, MConst, MCString,
+  MCInt, MCNone, MCSome, MParam, MType, MNamed, MOption, MArray, MResult, MTypeShape, MSRecord,
+  MSUnion, MSOpaque, MFieldView, MVariant, MDecl, MDFn, MDRecord, MRef, ref, named, encodeOutput,
+  decodeOutput, emptyInput, declName,
+} from "std:meta";
+import {
+  serviceProc, resolveServices, controllerProc, planControllers, routeOf, pathParams, bindMethod,
+  bindFunction, Binding, RouteSpec, applicationProc, newGen, encoderFor, decoderFor, Ctx, typeKey,
+  lowerCamel, splitList, upper,
+} from "../src/module";
+
+// ---- builders for the views ---------------------------------------------------------------------------------------------------
+
+function t(n: string): MType {
+  return MNamed(n, []);
+}
+
+function p(n: string, ty: MType): MParam {
+  return MParam { name: n, ty: ty };
+}
+
+function anno(name: string, args: MArg[]): MAnnotation {
+  return MAnnotation { source: "orin-web", name: name, args: args };
+}
+
+function strArg(n: string, v: string): MArg {
+  return MArg { name: n, value: MCString(v) };
+}
+
+function method(
+  n: string,
+  annotations: MAnnotation[],
+  params: MParam[],
+  returns: MType,
+): MMethodView {
+  return MMethodView {
+    ref: ref(1),
+    name: n,
+    exported: true,
+    typeParams: [],
+    params: params,
+    returns: returns,
+    doc: "",
+    annotations: annotations,
+    contracts: [],
+  };
+}
+
+function classView(
+  id: int,
+  n: string,
+  annotations: MAnnotation[],
+  methods: MMethodView[],
+): MDeclView {
+  return MDeclView {
+    ref: ref(id),
+    kind: MKClass,
+    name: n,
+    exported: true,
+    typeParams: [],
+    doc: "",
+    annotations: annotations,
+    contracts: [],
+    fields: [],
+    ctorParams: [],
+    methods: methods,
+    variants: [],
+    params: [],
+    ty: None,
+  };
+}
+
+function service(id: int, n: string, deps: MParam[], as: Option<string>): MDeclView {
+  const asArg = as.isSome()
+      ? MArg { name: "as", value: MCSome(MCString(as.unwrap())) }
+      : MArg { name: "as", value: MCNone };
+  return classView(id, n, [anno("Service", [asArg])], [method("create", [], deps, t(n))]);
+}
+
+function input(annotation: string, decls: MDeclView[], types: MTypeShape[]): Input {
+  return Input {
+    modulePath: "./beans",
+    annotation: annotation,
+    freshBase: 100,
+    decls: decls,
+    types: types,
+  };
+}
+
+function opaque(n: string, source: string): MTypeShape {
+  return MTypeShape { name: n, source: source, typeParams: [], shape: MSOpaque };
+}
+
+function record(n: string, source: string, fields: MParam[]): MTypeShape {
+  return MTypeShape {
+    name: n,
+    source: source,
+    typeParams: [],
+    shape: MSRecord(
+      fields.map(
+        f => MFieldView { ref: ref(2), name: f.name, ty: f.ty, exported: true, annotations: [] },
+      ),
+    ),
+  };
+}
+
+function messages(o: Output): string {
+  return o.diagnostics.map(d => d.message).join(" | ");
+}
+
+function names(decls: MDecl[]): string[] {
+  return decls.map(d => declName(d));
+}
+
+// ---- services -----------------------------------------------------------------------------------------------------------------
+
+@Test
+function servicesAreOrderedAfterTheirDependencies(): void {
+  const i = input(
+    "Service",
+    [
+      service(1, "TodoService", [p("repo", t("TodoRepository"))], None),
+      service(2, "MemoryRepository", [p("config", t("Config"))], Some("TodoRepository")),
+    ],
+    [opaque("TodoRepository", "./beans"), opaque("Config", "./config")],
+  );
+  const r = resolveServices(i);
+  assertEqUsize(r.problems.length, 0, "no problems");
+  assertEq(r.order[0], 1, "the repository first");
+  assertEq(r.order[1], 0, "then the service");
+  assertEqString(
+    r.beans[1].field,
+    "todoRepository",
+    "field is the lowerCamelCase of the type it is registered as",
+  );
+  assertEqUsize(r.external.length, 1, "Config comes from another module");
+  assertEqString(r.external[0].name, "config", "named like the parameter");
+  const o = serviceProc(i);
+  assertEqString(
+    names(o.decls).join(","),
+    "Services,ServicesDeps,buildServices",
+    "generated declarations",
+  );
+  assertEqUsize(o.diagnostics.length, 0, "no diagnostics");
+}
+
+@Test
+function serviceProblemsAreDiagnosticsAtTheClass(): void {
+  const lonely = classView(7, "Lonely", [anno("Service", [])], []);
+  const o = serviceProc(input("Service", [lonely], []));
+  assertEqUsize(o.decls.length, 0, "nothing is generated");
+  assertEqUsize(o.diagnostics.length, 1, "one diagnostic");
+  assertEq(o.diagnostics[0].at.id, 7, "at the class");
+  assert(messages(o).includes("needs a static factory `create(..)`"), "message");
+}
+
+@Test
+function cyclesAreSpelledOut(): void {
+  const o = serviceProc(
+    input(
+      "Service",
+      [
+        service(1, "A", [p("b", t("B"))], None),
+        service(2, "B", [p("c", t("C"))], None),
+        service(3, "C", [p("a", t("A"))], None),
+      ],
+      [],
+    ),
+  );
+  assertEqString(messages(o), "dependency cycle among services: A -> B -> C -> A", "cycle");
+}
+
+@Test
+function aSelfDependencyIsACycle(): void {
+  const o = serviceProc(input("Service", [service(1, "A", [p("a", t("A"))], None)], []));
+  assertEqString(messages(o), "dependency cycle among services: A -> A", "self cycle");
+}
+
+@Test
+function unprovidedAndDuplicateServices(): void {
+  const unprovided = serviceProc(
+    input(
+      "Service",
+      [service(1, "Needy", [p("x", t("Plain"))], None)],
+      [opaque("Plain", "./beans")],
+    ),
+  );
+  assert(
+    messages(unprovided).includes(
+      "Needy depends on Plain, which is declared in this module but no @Service provides it",
+    ),
+    "unprovided",
+  );
+  const dup = serviceProc(
+    input(
+      "Service",
+      [service(1, "One", [], Some("Shared")), service(2, "Two", [], Some("Shared"))],
+      [],
+    ),
+  );
+  assertEqString(messages(dup), "two services provide Shared: One and Two", "duplicate");
+  const mismatch = serviceProc(
+    input(
+      "Service",
+      [service(1, "One", [p("n", t("int"))], None), service(2, "Two", [p("n", t("string"))], None)],
+      [],
+    ),
+  );
+  assert(
+    messages(mismatch).includes(
+      "the dependency `n` of Two has type string, but another service declares `n` as int",
+    ),
+    "type clash",
+  );
+}
+
+@Test
+function dependenciesWithTheSameNameAndTypeAreShared(): void {
+  const r = resolveServices(
+    input(
+      "Service",
+      [service(1, "One", [p("n", t("int"))], None), service(2, "Two", [p("n", t("int"))], None)],
+      [],
+    ),
+  );
+  assertEqUsize(r.problems.length, 0, "no problems");
+  assertEqUsize(r.external.length, 1, "one shared dependency");
+}
+
+@Test
+function theOutputOfTheProcessorEncodes(): void {
+  const o = serviceProc(input("Service", [service(1, "A", [p("n", t("int"))], None)], []));
+  const text = encodeOutput(o);
+  assert(text.includes("buildServices"), "encoded");
+  assert(decodeOutput(text).isOk(), "decodes again");
+}
+
+// ---- routes and binding -------------------------------------------------------------------------------------------------------
+
+@Test
+function routesAndPathParameters(): void {
+  const m = method(
+    "find",
+    [anno("Get", [strArg("path", "/:id")])],
+    [p("id", t("int"))],
+    t("string"),
+  );
+  const r = routeOf(m).unwrap().unwrap();
+  assertEqString(r.verb + " " + r.path, "GET /:id", "route");
+  assert(routeOf(method("helper", [], [], t("int"))).unwrap().isNone(), "no route");
+  assert(
+    routeOf(
+      method(
+        "both",
+        [anno("Get", [strArg("path", "/")]), anno("Post", [strArg("path", "/")])],
+        [],
+        t("int"),
+      ),
+    ).isErr(),
+    "two routes",
+  );
+  assertEqString(pathParams("/orgs/:org/files/*rest").join(","), "org,rest", "pattern parameters");
+  assertEqUsize(pathParams("/plain").length, 0, "none");
+}
+
+@Test
+function bindingByNameAnnotationAndBody(): void {
+  const m = method(
+    "m",
+    [
+      anno("Query", [strArg("bindings", "page, size=pageSize")]),
+      anno("Header", [strArg("bindings", "trace=X-Trace")]),
+      anno("Body", [MArg { name: "parameter", value: MCNone }]),
+    ],
+    [
+      p("org", t("string")),
+      p("page", MOption(t("int"))),
+      p("size", MOption(t("int"))),
+      p("trace", MOption(t("string"))),
+      p("req", t("Request")),
+      p("todo", t("NewTodo")),
+    ],
+    t("string"),
+  );
+  const b = bindMethod(m, RouteSpec { verb: "GET", path: "/orgs/:org" });
+  assertEqUsize(b.problems.length, 0, "no problems");
+  assertEqString(
+    b.bindings.map(x => x.p.name + ":" + x.kind + ":" + x.wire).join(" "),
+    "org:path:org page:query:page size:query:pageSize trace:header:X-Trace req:req: todo:body:",
+    "bindings in parameter order",
+  );
+}
+
+@Test
+function bindingProblems(): void {
+  const unbound = bindMethod(
+    method("m", [], [p("limit", t("int"))], t("string")),
+    RouteSpec { verb: "GET", path: "/" },
+  );
+  assert(unbound.problems[0].includes("parameter `limit` of m is not bound"), "unbound");
+  const twice = bindMethod(
+    method(
+      "m",
+      [anno("Query", [strArg("bindings", "x")]), anno("Header", [strArg("bindings", "x")])],
+      [p("x", t("int"))],
+      t("string"),
+    ),
+    RouteSpec { verb: "GET", path: "/" },
+  );
+  assert(twice.problems[0].includes("parameter `x` of m is bound twice"), "twice");
+  const unknown = bindMethod(
+    method("m", [anno("Query", [strArg("bindings", "nope")])], [], t("string")),
+    RouteSpec { verb: "GET", path: "/" },
+  );
+  assert(unknown.problems[0].includes("`nope`, which is not a parameter of m"), "unknown");
+  const bodies = bindMethod(
+    method(
+      "m",
+      [anno("Body", [MArg { name: "parameter", value: MCNone }])],
+      [p("a", t("A")), p("b", t("B"))],
+      t("string"),
+    ),
+    RouteSpec { verb: "POST", path: "/" },
+  );
+  assert(bodies.problems[0].includes("@Body needs exactly one parameter"), "ambiguous body");
+}
+
+@Test
+function bindFunctionsByKindAndType(): void {
+  const f = (kind: string, ty: MType): string => bindFunction(Binding {
+    p: p("x", ty),
+    kind: kind,
+    wire: "x",
+  });
+  assertEqString(f("path", t("int")), "bindPathInt", "path int");
+  assertEqString(f("path", t("string")), "bindPathString", "path string");
+  assertEqString(f("path", MOption(t("int"))), "", "no optional path parameter");
+  assertEqString(f("query", t("bool")), "bindQueryBool", "query bool");
+  assertEqString(f("query", MOption(t("int"))), "bindQueryIntOpt", "query option");
+  assertEqString(f("query", MArray(t("string"))), "bindQueryStrings", "query list");
+  assertEqString(f("query", MArray(t("int"))), "bindQueryInts", "query ints");
+  assertEqString(f("query", t("float")), "", "float is not supported");
+  assertEqString(f("header", t("string")), "bindHeader", "header");
+  assertEqString(f("header", MOption(t("string"))), "bindHeaderOpt", "header option");
+  assertEqString(f("header", MOption(t("bool"))), "bindHeaderBoolOpt", "header bool option");
+}
+
+// ---- controllers --------------------------------------------------------------------------------------------------------------
+
+function controller(deps: MParam[], methods: MMethodView[]): MDeclView {
+  let ms = methods;
+  ms.push(method("create", [], deps, t("C")));
+  return classView(5, "C", [anno("Controller", [strArg("prefix", "/c")])], ms);
+}
+
+@Test
+function aControllerGeneratesItsRegistration(): void {
+  const get = method(
+    "one",
+    [anno("Get", [strArg("path", "/:id")])],
+    [p("id", t("int"))],
+    t("string"),
+  );
+  const o = controllerProc(
+    input("Controller", [controller([p("svc", t("Svc"))], [get])], [opaque("Svc", "./beans")]),
+  );
+  assertEqUsize(o.diagnostics.length, 0, messages(o));
+  const n = names(o.decls);
+  assert(n.includes("ControllerDeps"), "deps record");
+  assert(n.includes("registerControllers"), "registration");
+  assert(
+    n.includes("registerControllersFrom"),
+    "from the services of the module, because Svc is local",
+  );
+  assert(o.imports.length > 0, "imports of the runtime");
+  assert(decodeOutput(encodeOutput(o)).isOk(), "encodes");
+}
+
+@Test
+function dependenciesFromAnotherModuleHaveNoFromFunction(): void {
+  const get = method("one", [anno("Get", [strArg("path", "/")])], [], t("string"));
+  const o = controllerProc(
+    input("Controller", [controller([p("svc", t("Svc"))], [get])], [opaque("Svc", "./elsewhere")]),
+  );
+  assertEqUsize(o.diagnostics.length, 0, messages(o));
+  assert(!names(o.decls).includes("registerControllersFrom"), "no mapping from Services");
+}
+
+@Test
+function controllerProblems(): void {
+  const noFactory = classView(5, "C", [anno("Controller", [strArg("prefix", "/c")])], []);
+  assert(
+    messages(controllerProc(input("Controller", [noFactory], []))).includes(
+      "needs a static factory",
+    ),
+    "factory",
+  );
+  const badBind = method(
+    "one",
+    [anno("Get", [strArg("path", "/")])],
+    [p("limit", t("int"))],
+    t("string"),
+  );
+  const o = controllerProc(input("Controller", [controller([], [badBind])], []));
+  assertEq(o.diagnostics[0].at.id, 1, "at the method");
+  assert(messages(o).includes("C.parameter `limit` of one is not bound"), "names the controller");
+  const badResult = method(
+    "one",
+    [anno("Get", [strArg("path", "/")])],
+    [],
+    MResult(t("string"), t("string")),
+  );
+  assert(
+    messages(controllerProc(input("Controller", [controller([], [badResult])], []))).includes(
+      "the error type of the result must be WebError",
+    ),
+    "error type",
+  );
+  const clash = controllerProc(
+    input(
+      "Controller",
+      [
+        controller([p("n", t("int"))], []),
+        classView(
+          6,
+          "D",
+          [anno("Controller", [strArg("prefix", "/d")])],
+          [method("create", [], [p("n", t("string"))], t("D"))],
+        ),
+      ],
+      [],
+    ),
+  );
+  assert(
+    messages(clash).includes(
+      "the dependency `n` of D has type string, but another controller declares it as int",
+    ),
+    "type clash",
+  );
+}
+
+@Test
+function resultsAreMappedByShape(): void {
+  const get = (r: MType): Output => controllerProc(
+    input(
+      "Controller",
+      [controller([], [method("one", [anno("Get", [strArg("path", "/")])], [], r)])],
+      [],
+    ),
+  );
+  assertEqUsize(get(t("Response")).diagnostics.length, 0, "Response");
+  assertEqUsize(
+    get(MResult(t("Response"), t("WebError"))).diagnostics.length,
+    0,
+    "Result<Response>",
+  );
+  assertEqUsize(get(t("void")).diagnostics.length, 0, "void");
+  assertEqUsize(get(MResult(t("void"), t("WebError"))).diagnostics.length, 0, "Result<void>");
+  assertEqUsize(get(MOption(t("string"))).diagnostics.length, 0, "Option");
+  assertEqUsize(
+    get(MResult(MOption(t("int")), t("WebError"))).diagnostics.length,
+    0,
+    "Result<Option>",
+  );
+  assertEqUsize(get(MArray(t("string"))).diagnostics.length, 0, "array");
+  assert(
+    messages(get(t("float"))).includes("type float cannot be written as or read from JSON"),
+    "float",
+  );
+}
+
+// ---- codecs -------------------------------------------------------------------------------------------------------------------
+
+@Test
+function codecsAreGeneratedOncePerType(): void {
+  const types = [
+    record("Address", "./model", [p("zip", t("int"))]),
+    record(
+      "User",
+      "./model",
+      [
+        p("name", t("string")),
+        p("home", t("Address")),
+        p("past", MArray(t("Address"))),
+        p("nick", MOption(t("string"))),
+      ],
+    ),
+  ];
+  const ctx = Ctx { types: types, modulePath: "./beans", at: ref(1), where: "C.m" };
+  const e = encoderFor(newGen(0), ctx, t("User"));
+  assertEqUsize(e.gen.problems.length, 0, "encoder");
+  assertEqUsize(
+    e.gen.decls.length,
+    4,
+    "User, Address, Address[], Option<string> (Address once; string needs no helper)",
+  );
+  const again = encoderFor(e.gen, ctx, t("User"));
+  assertEqString(again.fnName, e.fnName, "memoised");
+  assertEqUsize(again.gen.decls.length, 4, "nothing new");
+  const d = decoderFor(newGen(0), ctx, t("User"));
+  assertEqUsize(d.gen.problems.length, 0, "decoder");
+  assert(d.gen.imports.length > 0, "records of other modules are imported");
+}
+
+@Test
+function aTypeThatContainsItselfTerminates(): void {
+  const types = [record("Tree", "./beans", [p("name", t("string")), p("kids", MArray(t("Tree")))])];
+  const ctx = Ctx { types: types, modulePath: "./beans", at: ref(1), where: "C.m" };
+  const e = encoderFor(newGen(0), ctx, t("Tree"));
+  assertEqUsize(e.gen.problems.length, 0, "no problems");
+  const d = decoderFor(newGen(0), ctx, t("Tree"));
+  assertEqUsize(d.gen.problems.length, 0, "no problems");
+}
+
+@Test
+function unsupportedTypesAreReported(): void {
+  const types = [
+    record("Bad", "./beans", [p("ratio", t("float"))]),
+    MTypeShape {
+      name: "Shape",
+      source: "./beans",
+      typeParams: [],
+      shape: MSUnion([MVariant { name: "Circle", payload: [t("int")] }]),
+    },
+    opaque("Widget", "./beans"),
+  ];
+  const ctx = Ctx { types: types, modulePath: "./beans", at: ref(9), where: "C.m" };
+  const f = (ty: MType): string => encoderFor(newGen(0), ctx, ty).gen.problems
+      .map(x => x.message)
+      .join("|");
+  assert(f(t("Bad")).includes("C.m: type float cannot be written"), "float field");
+  assert(f(t("Shape")).includes("type Shape"), "payload union");
+  assert(f(t("Widget")).includes("type Widget"), "class");
+  assert(f(t("Missing")).includes("type Missing"), "unknown type");
+  assertEq(encoderFor(newGen(0), ctx, t("Bad")).gen.problems[0].at.id, 9, "at the declaration");
+}
+
+// ---- the application ------------------------------------------------------------------------------------------------------------
+
+@Test
+function theApplicationGeneratesBuildApp(): void {
+  const app = classView(3, "TodoApp", [anno("Application", [])], []);
+  const o = applicationProc(input("Application", [app], []));
+  assertEqString(names(o.decls).join(","), "buildApp", "one function");
+  const two = applicationProc(
+    input("Application", [app, classView(4, "Other", [anno("Application", [])], [])], []),
+  );
+  assert(messages(two).includes("a module has one @Application"), "only one");
+}
+
+// ---- helpers ------------------------------------------------------------------------------------------------------------------
+
+@Test
+function textHelpers(): void {
+  assertEqString(lowerCamel("TodoService"), "todoService", "lowerCamel");
+  assertEqString(lowerCamel("x"), "x", "short");
+  assertEqString(upper("Patch"), "PATCH", "upper");
+  assertEqString(splitList(" a, b=c ,, d ").join("|"), "a|b=c|d", "splitList");
+  assertEqString(
+    typeKey(MResult(MArray(t("A")), MOption(MNamed("G", [t("int")])))),
+    "Result<A[],Option<G<int>>>",
+    "typeKey",
+  );
+}
+
+function assertEqUsize(actual: usize, expected: usize, msg: string): void {
+  assertEq(actual.toInt(), expected.toInt(), msg);
+}

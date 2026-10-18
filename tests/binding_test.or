@@ -1,0 +1,293 @@
+// The runtime half of the annotation layer: the functions the generated code calls. Every failure of the client is a 400 or 422 that
+// names the parameter.
+import { assert, assertEq, assertEqString } from "std:test";
+import { QueryPair } from "std:url";
+import { Get, Post } from "std:http";
+import { fromString } from "std:bytes";
+import {
+  ValueObject, JsonMember, ValueString, JsonValue, parseDocument, defaultReadOptions,
+} from "std:json";
+import { DecodeCursor, DecodeError, decodeRoot } from "std:json/decode";
+import { defaultLimits } from "std:json";
+import {
+  Request, Response, WebError, Router, Handler, testRequest, webErrorStatus, webErrorMessage,
+  bindPathString, bindPathInt, bindPathBool, bindQueryString, bindQueryInt, bindQueryBool,
+  bindQueryStringOpt, bindQueryIntOpt, bindQueryBoolOpt, bindQueryStrings, bindQueryInts,
+  bindHeader, bindHeaderInt, bindHeaderBool, bindHeaderOpt, bindHeaderIntOpt, bindHeaderBoolOpt,
+  respondValue, respondResult, respondOption, respondResultOption, respondResponse, respondUnit,
+  respondResultUnit, encArray, encOption, jsonString, jsonInt, jsonPassthrough, decStr, decInt,
+  decBool, decArr, decField, decFieldOpt, decEnum, decodeBodyWith, notFound, newMiddlewares,
+  Middlewares, useAll, useGroup, addRoute, mountGroup, wireController, newRouter, TestClient,
+  Middleware, internalError,
+} from "../src/module";
+
+function status<T>(r: Result<T, WebError>): int {
+  return r.isErr() ? webErrorStatus(r.unwrapErr()) : 0;
+}
+
+function message<T>(r: Result<T, WebError>): string {
+  return r.isErr() ? webErrorMessage(r.unwrapErr()) : "";
+}
+
+function withParam(req: Request, k: string, v: string): Request {
+  return req.withParams([QueryPair { key: k, value: v }]);
+}
+
+// ---- binding ----------------------------------------------------------------------------------------------------------------
+
+@Test
+function pathParameters(): void {
+  const r = withParam(testRequest(Get, "/"), "id", "42");
+  assertEqString(bindPathString(r, "id").unwrap(), "42", "string");
+  assertEq(bindPathInt(r, "id").unwrap(), 42, "int");
+  assertEq(status(bindPathBool(r, "id")), 400, "42 is not a bool");
+  assertEq(
+    bindPathInt(withParam(testRequest(Get, "/"), "id", "-7"), "id").unwrap(),
+    -7,
+    "negative",
+  );
+  assert(bindPathBool(withParam(testRequest(Get, "/"), "on", "TRUE"), "on").unwrap(), "any case");
+  assert(!bindPathBool(withParam(testRequest(Get, "/"), "on", "0"), "on").unwrap(), "0");
+}
+
+@Test
+function aMissingOrMalformedPathParameterIsA400(): void {
+  const none = testRequest(Get, "/");
+  assertEq(status(bindPathString(none, "id")), 400, "missing");
+  assertEqString(
+    message(bindPathString(none, "id")),
+    "missing path parameter 'id'",
+    "missing text",
+  );
+  assertEq(status(bindPathInt(none, "id")), 400, "missing int");
+  const bad = withParam(none, "id", "4x2");
+  assertEq(status(bindPathInt(bad, "id")), 400, "bad int");
+  assertEqString(
+    message(bindPathInt(bad, "id")),
+    "path parameter 'id' must be a whole number",
+    "bad int text",
+  );
+  assertEqString(
+    message(bindPathBool(withParam(none, "on", "maybe"), "on")),
+    "path parameter 'on' must be true or false",
+    "bad bool text",
+  );
+}
+
+@Test
+function queryParameters(): void {
+  const r = testRequest(Get, "/?page=3&q=hi+there&on=true&tag=a&tag=b&n=1&n=2");
+  assertEq(bindQueryInt(r, "page").unwrap(), 3, "int");
+  assertEqString(bindQueryString(r, "q").unwrap(), "hi there", "decoded string");
+  assert(bindQueryBool(r, "on").unwrap(), "bool");
+  assertEqString(bindQueryStrings(r, "tag").unwrap().join(","), "a,b", "list");
+  assertEqString(
+    bindQueryInts(r, "n").unwrap().map(x => x.toString()).join(","),
+    "1,2",
+    "int list",
+  );
+  assertEqUsize(bindQueryStrings(r, "none").unwrap().length, 0, "empty list");
+  assertEq(status(bindQueryInt(r, "none")), 400, "required and absent");
+  assertEqString(message(bindQueryInt(r, "none")), "missing query parameter 'none'", "text");
+  assertEq(status(bindQueryInt(r, "q")), 400, "malformed");
+  assertEq(status(bindQueryInts(testRequest(Get, "/?n=1&n=x"), "n")), 400, "malformed in a list");
+}
+
+@Test
+function optionalQueryParameters(): void {
+  const r = testRequest(Get, "/?page=3&on=false&bad=zz");
+  assertEq(bindQueryIntOpt(r, "page").unwrap().unwrap(), 3, "present");
+  assert(bindQueryIntOpt(r, "none").unwrap().isNone(), "absent is None");
+  assertEq(status(bindQueryIntOpt(r, "bad")), 400, "present and malformed is still an error");
+  assert(!bindQueryBoolOpt(r, "on").unwrap().unwrap(), "bool");
+  assert(bindQueryStringOpt(r, "none").unwrap().isNone(), "string");
+}
+
+@Test
+function headerParameters(): void {
+  const r = testRequest(Get, "/")
+      .withHeader("X-Count", "5")
+      .withHeader("X-Flag", "true")
+      .withHeader("X-Name", "ann");
+  assertEqString(bindHeader(r, "x-name").unwrap(), "ann", "case-insensitive");
+  assertEq(bindHeaderInt(r, "X-Count").unwrap(), 5, "int");
+  assert(bindHeaderBool(r, "X-Flag").unwrap(), "bool");
+  assertEq(status(bindHeader(r, "X-Missing")), 400, "missing");
+  assertEqString(message(bindHeader(r, "X-Missing")), "missing header 'X-Missing'", "text");
+  assertEq(status(bindHeaderInt(r, "X-Name")), 400, "malformed");
+  assert(bindHeaderOpt(r, "X-Missing").unwrap().isNone(), "optional");
+  assertEq(bindHeaderIntOpt(r, "X-Count").unwrap().unwrap(), 5, "optional int");
+  assert(bindHeaderBoolOpt(r, "X-Missing").unwrap().isNone(), "optional bool");
+  assertEq(status(bindHeaderIntOpt(r, "X-Name")), 400, "optional but malformed");
+}
+
+// ---- responses --------------------------------------------------------------------------------------------------------------
+
+@Test
+function respondingWithValues(): void {
+  const ok = respondValue(201, "hi", jsonString).unwrap();
+  assertEq(ok.status(), 201, "status");
+  assertEqString(ok.bodyText(), "\"hi\"", "json");
+  assertEqString(respondResult(200, Ok(3), jsonInt).unwrap().bodyText(), "3", "Ok");
+  assertEq(status(respondResult(200, Err(notFound("x")), jsonInt)), 404, "Err passes through");
+  assertEqString(respondOption(200, Some(1), jsonInt).unwrap().bodyText(), "1", "Some");
+  assertEq(status(respondOption(200, None, jsonInt)), 404, "None is 404");
+  assertEq(status(respondResultOption(200, Ok(None), jsonInt)), 404, "Ok(None) is 404");
+  assertEq(status(respondResultOption(200, Err(internalError("x")), jsonInt)), 500, "Err");
+  assertEqString(
+    respondResultOption(200, Ok(Some(2)), jsonInt).unwrap().bodyText(),
+    "2",
+    "Ok(Some)",
+  );
+  assertEqString(respondResponse(Response.text(202, "raw")).unwrap().bodyText(), "raw", "Response");
+  assertEq(respondUnit(204).unwrap().status(), 204, "unit");
+  assertEq(respondResultUnit(Ok(), 204).unwrap().status(), 204, "Result<void> ok");
+  assertEq(status(respondResultUnit(Err(notFound("x")), 204)), 404, "Result<void> err");
+  assertEqString(
+    respondValue(200, [1, 2], (xs: int[]): JsonValue => encArray(xs, jsonInt)).unwrap().bodyText(),
+    "[1,2]",
+    "array",
+  );
+  assertEqString(
+    respondValue(200, None, (o: Option<int>): JsonValue => encOption(o, jsonInt))
+        .unwrap()
+        .bodyText(),
+    "null",
+    "None as null",
+  );
+  assertEq(
+    status(respondValue(200, ValueString("\xff"), jsonPassthrough)),
+    500,
+    "a value the JSON writer refuses is a 500",
+  );
+}
+
+// ---- codecs -----------------------------------------------------------------------------------------------------------------
+
+type Color = Red | Green;
+type Pen = { name: string; width: int; color: Color; tags: string[]; note: Option<string>; };
+
+function decColor(c: DecodeCursor): Result<Color, DecodeError> {
+  return decEnum(c, ["Red", "Green"], [Red, Green]);
+}
+
+function decPen(c: DecodeCursor): Result<Pen, DecodeError> {
+  const name = decField(c, "name", decStr)?;
+  const width = decField(c, "width", decInt)?;
+  const color = decField(c, "color", decColor)?;
+  const tags = decField(
+    c,
+    "tags",
+    (e: DecodeCursor): Result<string[], DecodeError> => decArr(e, decStr),
+  )?;
+  const note = decFieldOpt(c, "note", decStr)?;
+  return Ok(Pen { name: name, width: width, color: color, tags: tags, note: note });
+}
+
+function pen(body: string): Result<Pen, WebError> {
+  return decodeBodyWith(testRequest(Post, "/").withBody(fromString(body)), decPen);
+}
+
+@Test
+function decodingABody(): void {
+  const p = pen(
+    "{\"name\":\"b\",\"width\":3,\"color\":\"Green\",\"tags\":[\"x\"],\"note\":\"n\"}",
+  ).unwrap();
+  assertEqString(p.name, "b", "string");
+  assertEq(p.width, 3, "int");
+  assert(p.color == Green, "tag");
+  assertEqString(p.tags.join(","), "x", "array");
+  assertEqString(p.note.unwrap(), "n", "option");
+  assert(
+    pen("{\"name\":\"b\",\"width\":3,\"color\":\"Red\",\"tags\":[],\"note\":null}").unwrap().note.isNone(),
+    "null is None",
+  );
+  assert(
+    pen("{\"name\":\"b\",\"width\":3,\"color\":\"Red\",\"tags\":[]}").unwrap().note.isNone(),
+    "absent is None",
+  );
+}
+
+@Test
+function aBodyThatIsNotJsonIs400AndOneOfTheWrongShapeIs422(): void {
+  assertEq(status(pen("{")), 400, "not JSON");
+  assertEq(status(pen("")), 400, "empty");
+  assertEq(
+    status(decodeBodyWith(testRequest(Post, "/").withBody(fromString("\xff")), decPen)),
+    400,
+    "not UTF-8",
+  );
+  assertEq(status(pen("[]")), 422, "not an object");
+  const missing = pen("{\"width\":3,\"color\":\"Red\",\"tags\":[]}");
+  assertEq(status(missing), 422, "missing field");
+  assert(message(missing).includes("name"), "names the field: " + message(missing));
+  assertEq(
+    status(pen("{\"name\":1,\"width\":3,\"color\":\"Red\",\"tags\":[]}")),
+    422,
+    "wrong type",
+  );
+  assertEq(
+    status(pen("{\"name\":\"b\",\"width\":3.5,\"color\":\"Red\",\"tags\":[]}")),
+    422,
+    "not an int",
+  );
+  const color = pen("{\"name\":\"b\",\"width\":3,\"color\":\"Blue\",\"tags\":[]}");
+  assertEq(status(color), 422, "unknown tag");
+  assert(message(color).includes("one of Red, Green"), "lists the tags: " + message(color));
+  const elem = pen("{\"name\":\"b\",\"width\":3,\"color\":\"Red\",\"tags\":[\"a\",2]}");
+  assertEq(status(elem), 422, "wrong element");
+  assert(message(elem).includes("tags"), "names the path: " + message(elem));
+}
+
+// ---- wiring -----------------------------------------------------------------------------------------------------------------
+
+class Greeter {
+  constructor(public greeting: string) {}
+}
+
+function greet(g: Greeter, req: Request): Result<Response, WebError> {
+  return Ok(Response.text(200, g.greeting + " " + req.param("who").unwrapOr("?")));
+}
+
+function stamp(label: string): Middleware {
+  return (req: Request, next: Handler): Result<Response, WebError> => {
+    const r = next(req.withAttr("trace", req.attr("trace").unwrapOr("") + label));
+    return r.isOk()
+        ? Ok(r.unwrap().withHeader("X-Trace", req.attr("trace").unwrapOr("") + label))
+        : r;
+  };
+}
+
+@Test
+function middlewaresAreNamed(): void {
+  const m = newMiddlewares().with("a", stamp("A")).with("b", stamp("B"));
+  assert(m.has("a") && m.has("b") && !m.has("c"), "has");
+  assert(m.get("a").isSome() && m.get("c").isNone(), "get");
+  const replaced = m.with("a", stamp("Z"));
+  assert(replaced.has("a") && replaced.has("b"), "replacing keeps the others");
+  assert(!newMiddlewares().has("a"), "empty");
+}
+
+@Test
+function aControllerMethodBecomesAHandlerBehindNamedMiddleware(): void {
+  const mws = newMiddlewares().with("one", stamp("1")).with("two", stamp("2"));
+  const handler = useAll(mws, "one, two", "G.greet", wireController(new Greeter("hello"), greet));
+  let group = newRouter();
+  group = useGroup(group, mws, "one", "G");
+  group = addRoute(group, "GET", "/hi/:who", handler);
+  let app = newRouter();
+  app = mountGroup(app, "/api", group);
+  const res = new TestClient(app).get("/api/hi/ann");
+  assertEq(res.status(), 200, "routed");
+  assertEqString(res.bodyText(), "hello ann", "the controller instance is captured");
+  assertEqString(
+    res.header("X-Trace").unwrapOr("-"),
+    "1",
+    "the outermost middleware stamps last, with what it saw first",
+  );
+  assertEqString(app.patterns().join(","), "GET /api/hi/:who", "mounted pattern");
+}
+
+function assertEqUsize(actual: usize, expected: usize, msg: string): void {
+  assertEq(actual.toInt(), expected.toInt(), msg);
+}

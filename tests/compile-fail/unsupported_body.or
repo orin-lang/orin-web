@@ -1,0 +1,19 @@
+// expect: type Widget cannot be written as or read from JSON
+import { Controller, Post, Body } from "orin-web";
+
+export class Widget {
+  constructor(public n: int) {}
+}
+
+@Controller("/x")
+export class C {
+  constructor(public n: int) {}
+  static create(n: int): C {
+    return new C(n);
+  }
+  @Post("/")
+  @Body
+  add(w: Widget): string {
+    return "x";
+  }
+}

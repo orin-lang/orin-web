@@ -1,0 +1,14 @@
+// expect: parameter `limit` of list is not bound
+import { Controller, Get } from "orin-web";
+
+@Controller("/x")
+export class C {
+  constructor(public n: int) {}
+  static create(n: int): C {
+    return new C(n);
+  }
+  @Get("/")
+  list(limit: int): string {
+    return "x";
+  }
+}

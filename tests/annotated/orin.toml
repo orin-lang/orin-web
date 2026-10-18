@@ -1,0 +1,11 @@
+[package]
+name = "annotated-tests"
+version = "0.1.0"
+entry = "src/main.or"
+
+[dependencies]
+orin-web = { path = "../.." }
+
+# The processors of orin-web run for this package.
+[annotations]
+processors = ["orin-web"]

@@ -1,0 +1,28 @@
+// expect: two services provide Shared: One and Two
+import { Service } from "orin-web";
+
+export interface Shared {
+  name(): string;
+}
+
+@Service("Shared")
+export class One implements Shared {
+  constructor(public x: int) {}
+  static create(x: int): One {
+    return new One(x);
+  }
+  name(): string {
+    return "one";
+  }
+}
+
+@Service("Shared")
+export class Two implements Shared {
+  constructor(public x: int) {}
+  static create(x: int): Two {
+    return new Two(x);
+  }
+  name(): string {
+    return "two";
+  }
+}

@@ -1,0 +1,14 @@
+// expect: Needy depends on Plain, which is declared in this module but no @Service provides it
+import { Service } from "orin-web";
+
+export class Plain {
+  constructor(public x: int) {}
+}
+
+@Service
+export class Needy {
+  constructor(public p: Plain) {}
+  static create(p: Plain): Needy {
+    return new Needy(p);
+  }
+}

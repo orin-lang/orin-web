@@ -1,0 +1,15 @@
+// expect: @Path binds `code` to `code`, but the route /x has no path parameter of that name
+import { Controller, Get, Path } from "orin-web";
+
+@Controller("/")
+export class C {
+  constructor(public n: int) {}
+  static create(n: int): C {
+    return new C(n);
+  }
+  @Get("/x")
+  @Path("code")
+  one(code: string): string {
+    return code;
+  }
+}

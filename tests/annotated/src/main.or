@@ -1,0 +1,112 @@
+// End-to-end checks of the annotation layer: the generated container and routes, driven through TestClient. Run with `orin run`
+// (`orin test` does not expand companion modules); a failed check traps, which `tools/ci.sh` reports.
+import { assert, assertEq, assertEqString } from "std:test";
+import { Get } from "std:http";
+import {
+  TestClient, newMiddlewares, bearerToken, Middlewares, Request, Response, WebError, Router,
+  assertStatus, assertBody, assertHeader,
+} from "orin-web";
+import { ServicesDeps, buildApp } from "./beans.gen";
+
+function middlewares(): Middlewares {
+  return newMiddlewares()
+      .with(
+        "tag",
+        (req: Request, next: (r: Request) => Result<Response, WebError>): Result<Response, WebError> => {
+          const r = next(req);
+          return r.isOk() ? Ok(r.unwrap().withHeader("X-Tag", "yes")) : r;
+        },
+      )
+      .with("auth", bearerToken("s3", "admin"));
+}
+
+const NEW: string = "{\"title\":\"milk\",\"priority\":\"High\",\"tags\":[\"a\",\"b\"],\"note\":\"x\"}";
+
+function main(): void {
+  const app = buildApp(ServicesDeps { owner: "ann" }, middlewares());
+  const c = new TestClient(app);
+
+  // path parameters, injected services, class-level middleware
+  const one = c.get("/todos/7");
+  assertStatus(one, 200);
+  assertBody(
+    one,
+    "{\"id\":7,\"title\":\"ann todo 7\",\"done\":false,\"priority\":\"Normal\",\"tags\":[\"seed\"],\"note\":null}",
+  );
+  assertHeader(one, "Content-Type", "application/json");
+  assertHeader(one, "X-Tag", "yes");
+  assertStatus(c.get("/todos/500"), 404);
+  assertStatus(c.get("/nope"), 404);
+
+  // a bad path parameter is the client's mistake
+  const bad = c.get("/todos/abc");
+  assertStatus(bad, 400);
+  assertBody(bad, "{\"error\":\"path parameter 'id' must be a whole number\",\"status\":400}");
+
+  // query parameters: optional, renamed, malformed, repeated
+  assertEqString(c.get("/todos").bodyText().substring(0, 1), "[", "list");
+  assertEq(c.get("/todos?pageSize=1").bodyText().split("},{").length.toInt(), 1, "page size 1");
+  assertEq(
+    c.get("/todos?pageSize=1&page=1").bodyText().split("\"id\":2").length.toInt(),
+    2,
+    "second page",
+  );
+  assertStatus(c.get("/todos?page=x"), 400);
+  assertBody(c.get("/todos/tags?tag=a&tag=b"), "[\"a\",\"b\"]");
+  assertBody(c.get("/todos/tags"), "[]");
+
+  // headers and booleans
+  assertBody(c.withHeader("User-Agent", "curl").get("/todos/agent"), "\"curl\"");
+  assertBody(c.get("/todos/agent"), "\"none\"");
+  assertBody(c.get("/todos/flag/true"), "true");
+  assertStatus(c.get("/todos/flag/maybe"), 400);
+
+  // a Response is passed through; Option and Result<Option> map None to 404
+  assertBody(c.get("/todos/raw"), "raw");
+  assertBody(c.get("/todos/7/title"), "\"ann todo 7\"");
+  assertStatus(c.get("/todos/500/title"), 404);
+
+  // JSON bodies: decoded into a record, with the failures of a client
+  const made = c.post("/todos", NEW);
+  assertStatus(made, 201);
+  assert(
+    made
+        .bodyText()
+        .startsWith(
+          "{\"id\":100,\"title\":\"milk\",\"done\":false,\"priority\":\"High\",\"tags\":[\"a\",\"b\"],\"note\":\"x\"",
+        ),
+    "created",
+  );
+  assertStatus(c.post("/todos", "{\"title\":"), 400);
+  assertStatus(c.post("/todos", "{\"priority\":\"Low\",\"tags\":[],\"note\":null}"), 422);
+  assertStatus(c.post("/todos", "{\"title\":\"t\",\"priority\":\"Urgent\",\"tags\":[]}"), 422);
+  assertStatus(c.post("/todos", "{\"title\":\"t\",\"priority\":\"Low\",\"tags\":[1]}"), 422);
+  assertStatus(
+    c.post("/todos", "{\"title\":\"t\",\"priority\":\"Low\",\"tags\":[],\"extra\":1}"),
+    422,
+  );
+  assertStatus(c.post("/todos", "[]"), 422);
+  const optional = c.post("/todos", "{\"title\":\"t\",\"priority\":\"Low\",\"tags\":[]}");
+  assertStatus(optional, 201);
+  assert(optional.bodyText().endsWith("\"note\":null}"), "an absent Option is None");
+  assertStatus(c.put("/todos/7", NEW), 200);
+  assertStatus(c.put("/todos/500", NEW), 404);
+  assertStatus(c.put("/todos/7", "{"), 400);
+
+  // Result<void, WebError> is a 204
+  const gone = c.delete("/todos/7");
+  assertStatus(gone, 204);
+  assertEq(gone.bodyBytes().length().toInt(), 0, "no body");
+  assertStatus(c.delete("/todos/500"), 404);
+
+  // method-level middleware by name
+  assertStatus(c.get("/todos/secret"), 401);
+  assertBody(
+    c.withHeader("Authorization", "Bearer s3").get("/todos/secret"),
+    "\"secret for admin\"",
+  );
+
+  // 405 comes from the engine
+  assertStatus(c.patch("/todos/7", "{}"), 405);
+  console.log("annotated: ok");
+}

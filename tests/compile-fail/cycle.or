@@ -1,0 +1,18 @@
+// expect: dependency cycle among services: Alpha -> Beta -> Alpha
+import { Service } from "orin-web";
+
+@Service
+export class Alpha {
+  constructor(public b: Beta) {}
+  static create(b: Beta): Alpha {
+    return new Alpha(b);
+  }
+}
+
+@Service
+export class Beta {
+  constructor(public a: Alpha) {}
+  static create(a: Alpha): Beta {
+    return new Beta(a);
+  }
+}

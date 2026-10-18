@@ -1,0 +1,14 @@
+import { JsonValue, writeDocument, defaultLimits } from "std:json";
+import { jsonObject, jsonMember, jsonString, jsonInt, jsonBool } from "orin-web";
+import { Todo } from "./store";
+
+// The JSON text of a todo, for the event stream (the controller methods that return a `Todo` get their encoder generated).
+export function jsonText(t: Todo): string {
+  const v: JsonValue = jsonObject([
+    jsonMember("id", jsonInt(t.id)),
+    jsonMember("title", jsonString(t.title)),
+    jsonMember("done", jsonBool(t.done)),
+  ]);
+  const text = writeDocument(v, defaultLimits());
+  return text.isOk() ? text.unwrap() : "{}";
+}

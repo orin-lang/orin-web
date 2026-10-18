@@ -1,0 +1,52 @@
+// The business rules. It knows nothing about HTTP routes or JSON; it fails with `WebError`, which the controller returns as is.
+import { Service, WebError, notFound, unprocessable } from "orin-web";
+import { Todo, NewTodo } from "./store";
+import { TodoRepository } from "./repository";
+
+@Service
+export class TodoService {
+  constructor(private repo: TodoRepository) {}
+
+  static create(repo: TodoRepository): TodoService {
+    return new TodoService(repo);
+  }
+
+  list(): Todo[] {
+    return this.repo.list();
+  }
+
+  find(id: int): Result<Todo, WebError> {
+    for (const t of this.repo.list()) {
+      if (t.id == id) {
+        return Ok(t);
+      }
+    }
+    return Err(notFound("no todo " + id.toString()));
+  }
+
+  add(n: NewTodo): Result<Todo, WebError> {
+    if (n.title.length == 0 || n.title.length > 200) {
+      return Err(unprocessable("title must be 1 to 200 bytes"));
+    }
+    const t = this.repo.add(n.title);
+    if (t.isNone()) {
+      return Err(unprocessable("the todo list is not accepting writes"));
+    }
+    return Ok(t.unwrap());
+  }
+
+  toggle(id: int): Result<Todo, WebError> {
+    const t = this.repo.toggle(id);
+    if (t.isNone()) {
+      return Err(notFound("no todo " + id.toString()));
+    }
+    return Ok(t.unwrap());
+  }
+
+  remove(id: int): Result<void, WebError> {
+    if (this.repo.remove(id).isNone()) {
+      return Err(notFound("no todo " + id.toString()));
+    }
+    return Ok();
+  }
+}

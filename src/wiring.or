@@ -1,0 +1,146 @@
+// Runtime pieces of the annotation layer: what the generated registration code calls. A controller method becomes a plain
+// function `(controller, request) => Result<Response, WebError>`; `wireController` turns it into a `Handler` that has the
+// controller instance.
+//
+// Generated code cannot write `new X(..)` (std:meta has no such expression), so it calls ordinary functions such as `newRouter`.
+import { exit } from "std:process";
+import { WebError } from "./error";
+import { Request } from "./request";
+import { Response } from "./response";
+import { Router, Handler, Middleware, withMiddleware } from "./router";
+
+// newRouter(): Router -- an empty router.
+export function newRouter(): Router {
+  return new Router();
+}
+
+// wireController(c, method) -- the handler that calls `method(c, request)`. The controller is captured by value.
+export function wireController<C>(
+  c: C,
+  method: (c: C, req: Request) => Result<Response, WebError>,
+): Handler {
+  return (req: Request): Result<Response, WebError> => method(c, req);
+}
+
+// Middlewares -- the named middleware that `@Use("name")` and `@Auth` refer to. Names are chosen by the application:
+//
+//   const mws = newMiddlewares().with("auth", bearerToken("secret", "admin")).with("log", logger(sink));
+//
+// A route that names a middleware the registry lacks stops the program at start-up (exit status 101, naming the middleware and the
+// route), like a malformed route pattern: it is a mistake in the program, not a failure of a request.
+export class Middlewares {
+  private names: string[];
+  private items: Middleware[];
+
+  constructor(names: string[], items: Middleware[]) {
+    this.names = names;
+    this.items = items;
+  }
+
+  // with(name, mw): Middlewares -- a copy with `name` bound to `mw` (replacing an earlier binding).
+  with(name: string, mw: Middleware): Middlewares {
+    let ns: string[] = [];
+    let is: Middleware[] = [];
+    let i: usize = 0;
+    while (i < this.names.length) {
+      if (this.names[i] != name) {
+        ns.push(this.names[i]);
+        is.push(this.items[i]);
+      }
+      i += 1;
+    }
+    ns.push(name);
+    is.push(mw);
+    return new Middlewares(ns, is);
+  }
+
+  // has(name): bool -- `name` is bound.
+  has(name: string): bool {
+    return this.names.includes(name);
+  }
+
+  // get(name): Option<Middleware> -- the middleware bound to `name`.
+  get(name: string): Option<Middleware> {
+    let i: usize = 0;
+    while (i < this.names.length) {
+      if (this.names[i] == name) {
+        return Some(this.items[i]);
+      }
+      i += 1;
+    }
+    return None;
+  }
+}
+
+// newMiddlewares(): Middlewares -- an empty registry.
+export function newMiddlewares(): Middlewares {
+  return new Middlewares([], []);
+}
+
+function missingMiddleware(name: string, where: string): void {
+  console.error(
+    "trap: orin-web: " + where + " uses the middleware '" + name
+        + "', which is not registered (Middlewares.with)",
+  );
+  exit(101);
+}
+
+// splitNames(names) -- "auth, log" is ["auth", "log"].
+function splitNames(names: string): string[] {
+  return names.split(",").map(n => n.trim()).filter(n => n.length > 0);
+}
+
+// useAll(mws, names, where, handler) -- `handler` behind the middleware named in the comma-separated `names`; the first name is
+// the outermost. `where` ("TodoController.create") is for the start-up error.
+export function useAll(mws: Middlewares, names: string, where: string, handler: Handler): Handler {
+  let mw: Middleware[] = [];
+  for (const n of splitNames(names)) {
+    const found = mws.get(n);
+    if (found.isNone()) {
+      missingMiddleware(n, where);
+    } else {
+      mw.push(found.unwrap());
+    }
+  }
+  let h = handler;
+  let i = mw.length;
+  while (i > 0) {
+    i -= 1;
+    h = withMiddleware(mw[i], h);
+  }
+  return h;
+}
+
+// useGroup(router, mws, names, where) -- adds the named middleware to a group router with `use`, in order.
+export function useGroup(router: Router, mws: Middlewares, names: string, where: string): Router {
+  let r = router;
+  for (const n of splitNames(names)) {
+    const found = mws.get(n);
+    if (found.isNone()) {
+      missingMiddleware(n, where);
+    } else {
+      r.use(found.unwrap());
+    }
+  }
+  return r;
+}
+
+// addRoute(router, method, pattern, handler) -- `router` with one more route. (A generated function cannot call a mutating method on a
+// parameter, so it threads the router through this.)
+export function addRoute(
+  router: Router,
+  method: string,
+  pattern: string,
+  handler: Handler,
+): Router {
+  let r = router;
+  r.route(method, pattern, handler);
+  return r;
+}
+
+// mountGroup(router, prefix, group) -- `router` with the group mounted under `prefix`.
+export function mountGroup(router: Router, prefix: string, group: Router): Router {
+  let r = router;
+  r.mount(prefix, group);
+  return r;
+}

@@ -1,0 +1,63 @@
+// The annotations of the annotation layer that carry information but no processor of their own: the processors of `@Controller`,
+// `@Service` and `@Application` read them (docs/design.md, "The annotation model").
+//
+// Parameters cannot carry annotations in Orin (annotation targets are declarations, methods and fields), so how the parameters of a
+// controller method are bound is stated on the METHOD, by parameter name:
+//
+//   @Get("/orgs/:org/todos")
+//   @Query("page, size=pageSize")      // parameter `page` <- ?page=, parameter `size` <- ?pageSize=
+//   @Header("trace=X-Trace-Id")
+//   list(org: string, page: Option<int>, size: Option<int>, trace: Option<string>): Result<Todo[], WebError>
+//
+// A list is one string, comma-separated; an entry is `parameter` or `parameter=wire name`.
+
+// ---- routes (methods) ---------------------------------------------------------------------------------------------------
+
+@Annotation(method)
+export type Get = { path: string; };
+
+@Annotation(method)
+export type Post = { path: string; };
+
+@Annotation(method)
+export type Put = { path: string; };
+
+@Annotation(method)
+export type Patch = { path: string; };
+
+@Annotation(method)
+export type Delete = { path: string; };
+
+// The status of a successful answer (default 200, or 204 for a method that returns nothing).
+@Annotation(method)
+export type Status = { code: int; };
+
+// ---- parameter binding (methods) ------------------------------------------------------------------------------------------
+
+// Parameters bound to path parameters of the route. A parameter whose name is a path parameter of the route is bound without this.
+@Annotation(method)
+export type Path = { bindings: string; };
+
+// Parameters bound to query fields: `string`, `int`, `bool`, `Option<..>` of those (absent is allowed), `string[]`, `int[]`.
+@Annotation(method)
+export type Query = { bindings: string; };
+
+// Parameters bound to header fields: `string`, `int`, `bool` and `Option<..>` of those.
+@Annotation(method)
+export type Header = { bindings: string; };
+
+// The parameter that receives the JSON body, decoded into its (record) type. `@Body` alone names the only parameter that is bound
+// to nothing else; `@Body("todo")` names it.
+@Annotation(method)
+export type Body = { parameter: Option<string>; };
+
+// ---- middleware (classes and methods) -----------------------------------------------------------------------------------------
+
+// Middleware by name, comma-separated (`@Use("log, auth")`), looked up in the `Middlewares` passed to the generated registration.
+// On a controller it wraps every route; on a method, that route only.
+@Annotation(class, method)
+export type Use = { names: string; };
+
+// `@Auth` is `@Use("auth")`.
+@Annotation(class, method)
+export type Auth = {};

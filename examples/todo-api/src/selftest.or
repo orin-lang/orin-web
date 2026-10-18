@@ -1,0 +1,65 @@
+// `todo-api selftest`: drives the whole application (generated container, routes, bindings, the owner task) through TestClient, with
+// no socket. It is the end-to-end test of the example, run by tools/ci.sh. (`orin test` cannot be used: it does not expand the
+// generated companion modules.)
+import { assert, assertEq, assertEqString } from "std:test";
+import { Scope, scope, spawn, channel } from "std:task";
+import { TestClient, assertStatus, assertBody, assertHeader, readEvents } from "orin-web";
+import { Command, ownerLoop } from "./state";
+import { buildApp } from "./wiring";
+
+export function selftest(): void {
+  scope((s: Scope): void => {
+    const cmds = channel<Command>(16);
+    const rx = cmds.rx;
+    const owner = spawn(s, () => ownerLoop(rx));
+    const anon = new TestClient(buildApp(cmds.tx, "t0ken"));
+    const c = anon.withHeader("Authorization", "Bearer t0ken");
+
+    // pages need no token; the API does
+    assertBody(anon.get("/health"), "ok");
+    assertStatus(anon.get("/"), 200);
+    assertHeader(anon.get("/assets/app.css"), "Cache-Control", "public, max-age=300");
+    assertStatus(anon.get("/assets/nope.css"), 404);
+    const denied = anon.get("/api/todos");
+    assertStatus(denied, 401);
+    assertHeader(denied, "WWW-Authenticate", "Bearer");
+    assertStatus(anon.withHeader("Authorization", "Bearer wrong").get("/api/todos"), 401);
+
+    // create, read, list, toggle, delete
+    assertBody(c.get("/api/todos"), "[]");
+    const created = c.post("/api/todos", "{\"title\":\"milk\"}");
+    assertStatus(created, 201);
+    assertBody(created, "{\"id\":1,\"title\":\"milk\",\"done\":false}");
+    c.post("/api/todos", "{\"title\":\"eggs\"}");
+    assertBody(c.get("/api/todos/2"), "{\"id\":2,\"title\":\"eggs\",\"done\":false}");
+    assertBody(c.post("/api/todos/1/toggle", ""), "{\"id\":1,\"title\":\"milk\",\"done\":true}");
+    assertBody(c.get("/api/todos?done=true"), "[{\"id\":1,\"title\":\"milk\",\"done\":true}]");
+    assertBody(c.get("/api/todos?done=false"), "[{\"id\":2,\"title\":\"eggs\",\"done\":false}]");
+
+    // the failures of a client
+    assertStatus(c.get("/api/todos/x"), 400);
+    assertStatus(c.get("/api/todos/99"), 404);
+    assertStatus(c.get("/api/todos?done=maybe"), 400);
+    assertStatus(c.post("/api/todos", "{"), 400);
+    assertStatus(c.post("/api/todos", "{\"title\":1}"), 422);
+    assertStatus(c.post("/api/todos", "{\"title\":\"\"}"), 422);
+    assertStatus(c.post("/api/todos", "{\"title\":\"a\",\"x\":1}"), 422);
+    assertStatus(c.put("/api/todos", "{}"), 405);
+
+    // delete is a 204, then a 404
+    assertStatus(c.delete("/api/todos/1"), 204);
+    assertStatus(c.delete("/api/todos/1"), 404);
+
+    // the literal route /stream wins over /:id
+    const stream = c.get("/api/todos/stream");
+    assertHeader(stream, "Content-Type", "text/event-stream");
+    const events = readEvents(stream, 10);
+    assertEq(events.length.toInt(), 1, "one event per todo");
+    assertEqString(events[0].event.unwrap(), "todo", "event name");
+    assertEqString(events[0].data, "{\"id\":2,\"title\":\"eggs\",\"done\":false}", "payload");
+
+    cmds.tx.close();
+    owner.join();
+  });
+  console.log("todo-api selftest: ok");
+}

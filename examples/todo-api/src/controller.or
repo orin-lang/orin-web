@@ -1,0 +1,104 @@
+// The HTTP surface. Each method is one route; the annotations say which, and how the parameters and the result map to HTTP. The
+// processor of orin-web turns this class into route registrations (`orin expand` shows them).
+import { channel } from "std:task";
+import {
+  Response, WebError, Controller, Get, Post, Delete, Status, Auth, Query, Body, notFound, sseEvent,
+  SseEvent, textAsset, Asset,
+} from "orin-web";
+import { jsonText } from "./json";
+import { Todo, NewTodo } from "./store";
+import { TodoService } from "./service";
+
+@Controller("/api/todos")
+@Auth
+export class TodoController {
+  constructor(private todos: TodoService) {}
+
+  static create(todos: TodoService): TodoController {
+    return new TodoController(todos);
+  }
+
+  // GET /api/todos?done=true
+  @Get("/")
+  @Query("done")
+  list(done: Option<bool>): Todo[] {
+    const all = this.todos.list();
+    if (done.isNone()) {
+      return all;
+    }
+    return all.filter(t => t.done == done.unwrap());
+  }
+
+  // GET /api/todos/7: `id` is the path parameter `:id`; 404 when the service says so; 400 when it is not a number.
+  @Get("/:id")
+  find(id: int): Result<Todo, WebError> {
+    return this.todos.find(id);
+  }
+
+  // POST /api/todos {"title": ".."}: the body is decoded into a NewTodo (400 for a body that is not JSON, 422 for a wrong shape).
+  @Post("/")
+  @Body
+  @Status(201)
+  add(todo: NewTodo): Result<Todo, WebError> {
+    return this.todos.add(todo);
+  }
+
+  @Post("/:id/toggle")
+  toggle(id: int): Result<Todo, WebError> {
+    return this.todos.toggle(id);
+  }
+
+  @Delete("/:id")
+  remove(id: int): Result<void, WebError> {
+    return this.todos.remove(id);
+  }
+
+  // GET /api/todos/stream: the todos as server-sent events, then the stream ends. A method that builds its own Response returns it.
+  @Get("/stream")
+  stream(): Response {
+    const events = channel<SseEvent>(1024);
+    for (const t of this.todos.list()) {
+      events.tx.send(sseEvent("todo", jsonText(t)));
+    }
+    events.tx.close();
+    const rx = events.rx;
+    return Response.sse(() => rx.recv());
+  }
+}
+
+// The pages that need no login: no dependencies, so `create()` has no parameters.
+@Controller("/")
+export class PageController {
+  static create(): PageController {
+    return new PageController();
+  }
+
+  @Get("/")
+  page(): Response {
+    return Response.html(
+      200,
+      "<!doctype html><title>todos</title><h1>todos</h1><p>GET /api/todos with <code>Authorization: Bearer ...</code></p>",
+    );
+  }
+
+  @Get("/health")
+  health(): Response {
+    return Response.text(200, "ok");
+  }
+
+  // GET /assets/app.css: the wildcard `*path` is the parameter `path`.
+  @Get("/assets/*path")
+  asset(path: string): Result<Response, WebError> {
+    const assets: Asset[] = [textAsset("app.css", "body { font-family: sans-serif; }")];
+    for (const a of assets) {
+      if (a.path == path) {
+        return Ok(
+          Response
+              .bytes(200, a.contentType, a.body)
+              .withHeader("Cache-Control", "public, max-age=300"),
+        );
+      }
+    }
+    return Err(notFound(""));
+  }
+}

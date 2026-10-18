@@ -8,8 +8,8 @@ export {
 } from "./error";
 
 // Requests and responses.
-export { Request, RequestParts, decodeBody } from "./request";
-export { Response, Body, FixedBody, StreamBody } from "./response";
+export { Request, RequestParts, decodeBody, decodeBodyWith } from "./request";
+export { Response, ResponseBody, FixedBody, StreamBody } from "./response";
 export {
   jsonMember, jsonObject, jsonArray, jsonString, jsonInt, jsonBool, jsonNull,
 } from "./jsonbuild";
@@ -43,3 +43,39 @@ export {
 
 // The server (needs a NetGrant).
 export { ServerConfig, ServerHandle, defaultServerConfig, serve } from "./server";
+
+// Annotation layer: runtime support of the generated code.
+export {
+  bindPathString, bindPathInt, bindPathBool, bindQueryString, bindQueryInt, bindQueryBool,
+  bindQueryStringOpt, bindQueryIntOpt, bindQueryBoolOpt, bindQueryStrings, bindQueryInts,
+  bindHeader, bindHeaderInt, bindHeaderBool, bindHeaderOpt, bindHeaderIntOpt, bindHeaderBoolOpt,
+} from "./bind";
+export {
+  respondValue, respondResult, respondOption, respondResultOption, respondResponse, respondUnit,
+  respondResultUnit,
+} from "./respond";
+export {
+  encArray, encOption, jsonPassthrough, decStr, decInt, decBool, decArr, decField, decFieldOpt,
+  decEnum,
+} from "./codec";
+export {
+  Middlewares, newMiddlewares, newRouter, wireController, useAll, useGroup, addRoute, mountGroup,
+} from "./wiring";
+
+// Annotations (the processors live next to them).
+export { Service } from "./service";
+export { Controller } from "./controller";
+export { Application } from "./application";
+export {
+  Get, Post, Put, Patch, Delete, Status, Path, Query, Header, Body, Use, Auth,
+} from "./annotations";
+
+// Processor internals, exported so that the tests can call the processors as functions. Not API: they may change in any release.
+export { serviceProc, resolveServices, Bean, Resolution } from "./service";
+export {
+  controllerProc, planControllers, Plan, routeOf, pathParams, bindMethod, Bound, bindFunction,
+  Binding, RouteSpec,
+} from "./controller";
+export { applicationProc } from "./application";
+export { Ctx, Gen, Got, newGen, encoderFor, decoderFor, importsOf } from "./gen_codec";
+export { typeKey, plainName, lowerCamel, splitList, upper } from "./metautil";

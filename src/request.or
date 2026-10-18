@@ -6,9 +6,11 @@ import { Bytes } from "std:bytes";
 import {
   QueryPair, PlusAsSpace, PercentSpace, parseQuery, percentDecode, urlErrorMessage,
 } from "std:url";
-import { JsonValue, parseDocument, defaultReadOptions, jsonParseErrorMessage } from "std:json";
+import {
+  JsonValue, parseDocument, defaultReadOptions, defaultLimits, jsonParseErrorMessage,
+} from "std:json";
 import { isValid } from "std:utf8";
-import { DecodeError, decodeErrorMessage } from "std:json/decode";
+import { DecodeCursor, DecodeError, decodeErrorMessage, decodeRoot } from "std:json/decode";
 import { WebError, badRequest, notFound, unprocessable } from "./error";
 
 // The parts of a request, for `Request.tryNew`. `target` is the request-target as it came on the wire: an origin-form
@@ -360,6 +362,24 @@ export function decodeBody<T>(
 ): Result<T, WebError> {
   const doc = req.bodyJson()?;
   const r = decode(doc);
+  if (r.isErr()) {
+    return Err(unprocessable(decodeErrorMessage(r.unwrapErr())));
+  }
+  return Ok(r.unwrap());
+}
+
+// decodeBodyWith(req, dec): Result<T, WebError> -- `decodeBody` for a decoder that works on a cursor, the shape the generated record
+// decoders have (they nest). Same errors: 400 for a body that is not JSON, 422 for a wrong shape.
+export function decodeBodyWith<T>(
+  req: Request,
+  dec: (c: DecodeCursor) => Result<T, DecodeError>,
+): Result<T, WebError> {
+  const doc = req.bodyJson()?;
+  const root = decodeRoot(doc, defaultLimits());
+  if (root.isErr()) {
+    return Err(unprocessable(decodeErrorMessage(root.unwrapErr())));
+  }
+  const r = dec(root.unwrap());
   if (r.isErr()) {
     return Err(unprocessable(decodeErrorMessage(r.unwrapErr())));
   }

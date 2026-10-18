@@ -1,0 +1,7 @@
+// expect: needs a static factory `create(..)`
+import { Service } from "orin-web";
+
+@Service
+export class Lonely {
+  constructor(public x: int) {}
+}

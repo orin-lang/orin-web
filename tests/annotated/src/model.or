@@ -1,0 +1,10 @@
+export type Priority = Low | Normal | High;
+export type Todo = {
+  id: int;
+  title: string;
+  done: bool;
+  priority: Priority;
+  tags: string[];
+  note: Option<string>;
+};
+export type NewTodo = { title: string; priority: Priority; tags: string[]; note: Option<string>; };

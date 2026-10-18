@@ -27,7 +27,92 @@ $ curl localhost:8080/hello/ada
 
 Status: version 0.1, pre-release, like the language it is written in. The server and `std:net` are unstable until the std I/O freeze.
 
-## What is in it
+## Annotations: controllers and services
+
+Besides the functional API below, orin-web has a Spring-style front end: classes annotated `@Controller` and `@Service`, wired **at
+compile time** by annotation processors (ADR-0046) that generate calls into the same `Router`. No reflection, no run-time container.
+
+```ts
+@Service
+export class TodoService {
+  constructor(private repo: TodoRepository) {}
+  static create(repo: TodoRepository): TodoService { return new TodoService(repo); }     // see "Limits" below
+  find(id: int): Result<Todo, WebError> { .. }
+  add(n: NewTodo): Result<Todo, WebError> { .. }
+}
+
+@Controller("/api/todos")
+@Auth                                              // every route needs the middleware registered as "auth"
+export class TodoController {
+  constructor(private todos: TodoService) {}      // injected: resolved from the services
+  static create(todos: TodoService): TodoController { return new TodoController(todos); }
+
+  @Get("/")
+  @Query("done")                                   // ?done=true -> Option<bool>; absent is None, malformed is a 400
+  list(done: Option<bool>): Todo[] { .. }          // a value is written as JSON
+
+  @Get("/:id")                                     // `id` is the path parameter, bound by name: int, 400 if not a number
+  find(id: int): Result<Todo, WebError> { return this.todos.find(id); }
+
+  @Post("/")
+  @Body                                            // JSON body decoded into NewTodo: 400 not JSON, 422 wrong shape
+  @Status(201)
+  add(todo: NewTodo): Result<Todo, WebError> { return this.todos.add(todo); }
+
+  @Delete("/:id")
+  remove(id: int): Result<void, WebError> { .. }   // 204
+}
+```
+
+| Annotation | On | Meaning |
+|---|---|---|
+| `@Controller("/prefix")` | class | the methods with a route annotation become routes under the prefix |
+| `@Service` / `@Service("Interface")` | class | created and injected by the generated container; the second form registers it under an interface |
+| `@Get("/p")` `@Post` `@Put` `@Patch` `@Delete` | method | the route (`:id` and `*rest` patterns as in the functional API) |
+| `@Query("a, b=wire")` `@Header("x=X-Trace")` `@Path("id=wire")` | method | binds the *named parameters* to query fields, headers, path parameters |
+| `@Body` / `@Body("param")` | method | the parameter that receives the decoded JSON body |
+| `@Status(201)` | method | the success status (default 200; 204 for `void`) |
+| `@Use("a, b")` / `@Auth` | class, method | middleware by name, from the `Middlewares` registry (`@Auth` = `@Use("auth")`) |
+| `@Application` | type | generates `buildApp` for a module that holds both services and controllers |
+
+Parameters are bound **by name**: a `Request` parameter gets the request; a parameter named like a path parameter of the route gets it;
+the others are listed in `@Query`, `@Header`, `@Path` or `@Body` (Orin cannot annotate parameters, so the method carries the list).
+Supported parameter types: `string`, `int`, `bool`, `Option` of those (query, header), `string[]` and `int[]` (repeated query fields),
+and, for `@Body`, records of those, arrays, `Option`s and tag unions. A method returns a `Response`, a value, `Option<T>` (None is a
+404), `void` (204) or `Result<..., WebError>` of any of those; values are written as JSON by encoders generated from the type.
+
+What the processors generate for a module, in its companion `./module.gen` (read it with `orin expand`):
+
+```ts
+export type Services = { todoRepository: TodoRepository; todoService: TodoService; };     // @Service
+export type ServicesDeps = { commands: Sender<Command>; };      // dependencies nobody in the module provides: you pass them in
+export function buildServices(deps: ServicesDeps): Services     // creates the services in dependency order
+
+export type ControllerDeps = { todoService: TodoService; };     // @Controller
+export function registerControllers(router: Router, deps: ControllerDeps, mws: Middlewares): Router
+export function registerControllersFrom(router: Router, svc: Services, mws: Middlewares): Router   // when the deps are this module's services
+export function buildApp(deps: ServicesDeps, mws: Middlewares): Router                    // @Application
+```
+
+Dependencies are resolved **by type** among the services of a module, so a missing service, two services for one type and a dependency
+cycle (`A -> B -> A`) are compile errors at the class. An application spread over several modules (repository, service, controller
+files, as in `examples/todo-api`) connects the generated pieces in one small module without annotations. To use the processors, the
+package lists orin-web in `[annotations] processors` of its `orin.toml`:
+
+```toml
+[dependencies]
+orin-web = { git = "https://github.com/orin-lang/orin-web", rev = "COMMIT" }
+[annotations]
+processors = ["orin-web"]
+```
+
+Limits that come from `std:meta` (details and proposals in [docs/compiler-issues.md](docs/compiler-issues.md)): generated code cannot
+write `new X(..)`, so a bean has a one-line `static create` that forwards to its constructor; a module cannot import the generated
+code of another module, so cross-module wiring is hand-written; and `orin test` cannot expand generated code, so the end-to-end
+tests are programs (`tests/annotated`, `tools/ci.sh`).
+
+## What is in it (the functional API)
+
 
 | Area | API |
 |---|---|
@@ -202,18 +287,19 @@ target ([docs/wasm.md](https://github.com/orin-lang/orin-lang/blob/main/docs/was
 
 | | |
 |---|---|
-| [`examples/todo-api`](examples/todo-api) | a JSON service: bearer-protected group, CORS, logging, an owner task for state, an event stream, assets. Native. |
-| [`examples/edge`](examples/edge) | the same building blocks without a socket, driven line by line; builds for `wasm32-orbit`. |
+| [`examples/todo-api`](examples/todo-api) | annotation style: `TodoController`, `TodoService`, `OwnerTodoRepository` (a service injected into the service), an owner task for state, bearer auth, CORS, logging, an event stream, assets. Native. |
+| [`examples/edge`](examples/edge) | the functional API (`Router`, handlers) without a socket, driven line by line; builds for `wasm32-orbit`. |
+| [`tests/annotated`](tests/annotated) | every annotation feature in one module, checked through `TestClient`; builds and runs for `wasm32-orbit`. |
 
 ## Develop
 
 ```sh
-orin test                  # the library's tests: unit tests and loopback-socket tests
-tools/ci.sh                # tests, both examples' tests, the wasm32-orbit build of examples/edge
+orin test                  # the library's tests: unit tests, the processors as functions, loopback-socket tests
+tools/ci.sh                # everything: also the generated code end to end, the compile-time diagnostics, both examples, wasm32-orbit
 ```
 
-Layout: `src/module.or` (the public face), `src/*.or` (one concern per file), `tests/*_test.or`, `docs/design.md`,
-`docs/compiler-issues.md`.
+Layout: `src/module.or` (the public face), `src/*.or` (one concern per file; `service.or`, `controller.or`, `application.or` hold the
+annotations and their processors), `tests/*_test.or`, `tests/annotated`, `tests/compile-fail`, `docs/design.md`, `docs/compiler-issues.md`.
 
 ## License
 

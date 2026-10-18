@@ -1,26 +1,33 @@
-// todo-api: a small JSON service on orin-web.
+// todo-api: a JSON service written with the annotation layer of orin-web.
 //
-//   todo-api [port] [token]
-//     port    default 8080; 0 = any free port
-//     token   the bearer token of /api (default "dev-token")
+//   todo-api [port] [token]       serve (default port 8080, token "dev-token")
+//   todo-api selftest             run the service against itself through TestClient and exit
 //
 //   GET    /                        a page
-//   GET    /health                  {"status":"ok"}
-//   GET    /api/todos               the todos            (bearer token)
-//   POST   /api/todos               {"title":".."}       -> 201 + the todo
-//   POST   /api/todos/{id}/toggle   flips "done"
-//   DELETE /api/todos/{id}
-//   GET    /api/todos/stream        the todos as server-sent events
+//   GET    /health
+//   GET    /api/todos[?done=true]   the todos             (bearer token)
+//   GET    /api/todos/{id}
+//   POST   /api/todos               {"title":".."}  -> 201
+//   POST   /api/todos/{id}/toggle
+//   DELETE /api/todos/{id}          -> 204
+//   GET    /api/todos/stream        server-sent events
+//
+
 import { Host, withProcess, withNet } from "std:host";
 import { args } from "std:process";
 import { Scope, scopeNet, spawn, channel } from "std:task";
 import { NetGrant, netErrorMessage } from "std:net";
 import { ServerConfig, ServerHandle, defaultServerConfig, serve } from "orin-web";
 import { Command, ownerLoop } from "./state";
-import { buildApp } from "./app";
+import { buildApp } from "./wiring";
+import { selftest } from "./selftest";
 
 function main(host: Host): void {
   const argv = withProcess(host, p => args(p));
+  if (argv.length > 0 && argv[0] == "selftest") {
+    selftest();
+    return;
+  }
   const port = argv.length > 0 ? parseInt(argv[0]).unwrapOr(8080) : 8080;
   const token = argv.length > 1 ? argv[1] : "dev-token";
   const cfg = ServerConfig { ...defaultServerConfig(), port: port };

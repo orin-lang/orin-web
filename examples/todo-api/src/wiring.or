@@ -1,0 +1,27 @@
+// The one place that connects the beans: it passes the output of one generated companion to the next, in dependency order. The
+// compiler checks every connection (a missing or mistyped dependency does not compile). Why not generated: a module cannot import the
+// companion of another module while it uses processor annotations itself (ADR-0046), so the generated pieces of three modules are
+// joined here, in a module that has no annotations.
+import { Sender } from "std:task";
+import {
+  Router, newRouter, newMiddlewares, bearerToken, logger, cors, defaultCors,
+} from "orin-web";
+import * as repositories from "./repository.gen";
+import * as services from "./service.gen";
+import * as controllers from "./controller.gen";
+import { Command } from "./state";
+
+// The application: repository -> service -> controllers. `commands` is how the repository reaches the owner task.
+export function buildApp(commands: Sender<Command>, token: string): Router {
+  const mws = newMiddlewares().with("auth", bearerToken(token, "admin"));
+  const repos = repositories.buildServices(repositories.ServicesDeps { commands: commands });
+  const svcs = services.buildServices(services.ServicesDeps { repo: repos.todoRepository });
+  let app = controllers.registerControllers(
+    newRouter(),
+    controllers.ControllerDeps { todoService: svcs.todoService },
+    mws,
+  );
+  app.use(logger((line: string) => console.error(line)));
+  app.use(cors(defaultCors()));
+  return app;
+}
